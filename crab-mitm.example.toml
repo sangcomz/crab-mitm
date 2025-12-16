@@ -1,0 +1,23 @@
+## Example rules for crab-mitm
+##
+## match = prefix match
+## - starts with http:// or https://  => full URL prefix match
+## - starts with /                   => path prefix match
+## - otherwise                       => authority+path prefix match (e.g. example.com/api)
+
+[[map_local]]
+match = "example.com/"
+file = "./examples/local.txt"
+status = 200
+content_type = "text/plain; charset=utf-8"
+
+[[map_local]]
+match = "/health"
+text = "OK\n"
+status = 200
+content_type = "text/plain; charset=utf-8"
+
+[[status_rewrite]]
+match = "/api"
+from = 200
+to = 503
