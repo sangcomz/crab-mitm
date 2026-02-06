@@ -196,3 +196,94 @@ struct StatusRewriteConfig {
     from: Option<u16>,
     to: u16,
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use http::StatusCode;
+
+    use super::*;
+    use crate::rules::MapSource;
+
+    #[test]
+    fn parse_map_arg_validates_format() {
+        let parsed = parse_map_arg("example.com/=./local.txt").expect("valid map arg");
+        assert_eq!(parsed.matcher, "example.com/");
+        assert_eq!(parsed.path, PathBuf::from("./local.txt"));
+
+        assert!(parse_map_arg("=").is_err());
+        assert!(parse_map_arg("example.com/=").is_err());
+        assert!(parse_map_arg("=./local.txt").is_err());
+    }
+
+    #[test]
+    fn parse_rewrite_arg_supports_two_forms() {
+        let simple = parse_rewrite_arg("example.com/=418").expect("valid simple rewrite");
+        assert_eq!(simple.matcher, "example.com/");
+        assert_eq!(simple.from, None);
+        assert_eq!(simple.to, 418);
+
+        let conditional = parse_rewrite_arg("/api=200:503").expect("valid conditional rewrite");
+        assert_eq!(conditional.matcher, "/api");
+        assert_eq!(conditional.from, Some(200));
+        assert_eq!(conditional.to, 503);
+
+        assert!(parse_rewrite_arg("/api=abc").is_err());
+        assert!(parse_rewrite_arg("/api=200:abc").is_err());
+    }
+
+    #[test]
+    fn load_rules_reads_toml_and_applies_cli_first() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("crab-mitm-config-test-{now}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let local_path = dir.join("local.txt");
+        fs::write(&local_path, "LOCAL").expect("write local file");
+
+        let cfg_path = dir.join("rules.toml");
+        fs::write(
+            &cfg_path,
+            format!(
+                r#"
+[[map_local]]
+match = "example.com/"
+file = "{}"
+status = 201
+
+[[status_rewrite]]
+match = "example.com/"
+to = 503
+"#,
+                local_path.display()
+            ),
+        )
+        .expect("write config");
+
+        let cli_rewrite = RewriteArg {
+            matcher: "example.com/".to_string(),
+            from: None,
+            to: 418,
+        };
+        let rules = load_rules(Some(&cfg_path), &[], &[cli_rewrite]).expect("load rules");
+
+        assert_eq!(rules.map_local.len(), 1);
+        match &rules.map_local[0].source {
+            MapSource::File(path) => assert_eq!(path, &local_path),
+            _ => panic!("expected map_local file source"),
+        }
+        assert_eq!(rules.map_local[0].status, StatusCode::CREATED);
+
+        let rewritten = rules.rewrite_status("http", "example.com", "/", StatusCode::OK);
+        assert_eq!(rewritten, Some(StatusCode::IM_A_TEAPOT));
+
+        let _ = fs::remove_file(cfg_path);
+        let _ = fs::remove_file(local_path);
+        let _ = fs::remove_dir_all(dir);
+    }
+}

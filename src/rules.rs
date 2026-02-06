@@ -91,3 +91,54 @@ impl Rules {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matcher_supports_full_url_prefix() {
+        let m = Matcher::new("https://example.com/api");
+        assert!(m.is_match("https", "example.com", "/api/v1"));
+        assert!(!m.is_match("https", "example.com", "/health"));
+    }
+
+    #[test]
+    fn matcher_supports_path_prefix() {
+        let m = Matcher::new("/health");
+        assert!(m.is_match("http", "example.com", "/healthz"));
+        assert!(!m.is_match("http", "example.com", "/api"));
+    }
+
+    #[test]
+    fn matcher_supports_authority_and_path_prefix() {
+        let m = Matcher::new("example.com/api");
+        assert!(m.is_match("http", "example.com", "/api/v1"));
+        assert!(!m.is_match("http", "other.com", "/api/v1"));
+    }
+
+    #[test]
+    fn rewrite_status_respects_optional_from() {
+        let rules = Rules {
+            map_local: vec![],
+            status_rewrite: vec![
+                StatusRewriteRule {
+                    matcher: Matcher::new("/api"),
+                    from: Some(StatusCode::OK),
+                    to: StatusCode::SERVICE_UNAVAILABLE,
+                },
+                StatusRewriteRule {
+                    matcher: Matcher::new("/api"),
+                    from: None,
+                    to: StatusCode::IM_A_TEAPOT,
+                },
+            ],
+        };
+
+        let rewritten = rules.rewrite_status("http", "example.com", "/api", StatusCode::OK);
+        assert_eq!(rewritten, Some(StatusCode::SERVICE_UNAVAILABLE));
+
+        let rewritten = rules.rewrite_status("http", "example.com", "/api", StatusCode::CREATED);
+        assert_eq!(rewritten, Some(StatusCode::IM_A_TEAPOT));
+    }
+}

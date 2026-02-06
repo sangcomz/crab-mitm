@@ -6,6 +6,8 @@ Rust로 만든 간단한 MITM 프록시(HTTP/HTTPS)입니다. 네트워크 디�
 - HTTPS `CONNECT` MITM (CA 필요)
 - `map_local` (로컬 파일/텍스트로 응답 대체)
 - `status_rewrite` (응답 status code 변경)
+- 업스트림 request/response body 스트리밍 전달 (대용량 대응)
+- 바디 인스펙션 (샘플 로그 + 선택적 파일 스풀)
 - CLI 기반 설정 (TOML 파일 또는 CLI 플래그)
 
 ## 설치/빌드
@@ -28,7 +30,8 @@ cargo build --release
 ./target/release/crab-mitm run \
   --listen 127.0.0.1:8080 \
   --ca-cert ca.crt.pem --ca-key ca.key.pem \
-  --config crab-mitm.example.toml
+  --config crab-mitm.example.toml \
+  --inspect-body --inspect-sample-bytes 16384
 ```
 
 CA를 제공하지 않으면 HTTPS는 **터널링만** 하고(MITM 아님) `map_local/status_rewrite`는 HTTPS에 적용되지 않습니다.
@@ -92,7 +95,27 @@ to = 503
 ./target/release/crab-mitm run --rewrite-status 'example.com/=200:404'
 ```
 
+### 바디 인스펙션
+
+업스트림으로 전달되는 요청/응답 바디를 스트리밍하면서 관찰할 수 있습니다.
+
+```bash
+# 샘플 로그만 (각 바디 앞 16KB)
+./target/release/crab-mitm run --inspect-body
+
+# 샘플 로그 + 파일 스풀 (임시 디렉토리에 저장)
+./target/release/crab-mitm run --inspect-body --inspect-spool
+
+# 스풀 디렉토리/최대 크기 지정
+./target/release/crab-mitm run \
+  --inspect-body --inspect-spool \
+  --inspect-spool-dir ./spool \
+  --inspect-spool-max-bytes 104857600
+```
+
+`--inspect-spool`은 바디를 파일로 저장하므로 디스크 사용량과 민감정보 보관 정책을 함께 고려하세요.
+
 ## 주의
 
 - 디버깅 목적의 도구입니다. 외부에 열린 프록시로 사용하지 마세요.
-- 현재 구현은 request/response body를 메모리에 수집(버퍼링)합니다. 큰 파일/스트리밍에는 적합하지 않습니다.
+- 업스트림 request/response는 스트리밍 전달되지만, `--inspect-spool` 사용 시 디스크 I/O가 증가할 수 있습니다.

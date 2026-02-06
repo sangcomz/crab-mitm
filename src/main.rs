@@ -55,6 +55,26 @@ struct RunArgs {
     #[arg(long, value_parser = config::parse_rewrite_arg)]
     rewrite_status: Vec<config::RewriteArg>,
 
+    /// Enable request/response body inspection logs
+    #[arg(long, default_value_t = false)]
+    inspect_body: bool,
+
+    /// Number of bytes sampled from each body for log preview
+    #[arg(long, default_value_t = 16 * 1024)]
+    inspect_sample_bytes: usize,
+
+    /// Spool body bytes to files for later inspection (implies --inspect-body behavior)
+    #[arg(long, default_value_t = false)]
+    inspect_spool: bool,
+
+    /// Directory to place spool files (default: system temp dir)
+    #[arg(long)]
+    inspect_spool_dir: Option<PathBuf>,
+
+    /// Per-body spool file size cap in bytes
+    #[arg(long, default_value_t = 100 * 1024 * 1024)]
+    inspect_spool_max_bytes: u64,
+
     /// Increase log verbosity (-v, -vv)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -106,6 +126,13 @@ async fn main() -> Result<()> {
                 config::load_rules(args.config.as_deref(), &args.map, &args.rewrite_status)
                     .with_context(|| "failed to load rules")?,
             );
+            let inspect = Arc::new(proxy::InspectConfig {
+                enabled: args.inspect_body || args.inspect_spool,
+                sample_bytes: args.inspect_sample_bytes,
+                spool: args.inspect_spool,
+                spool_dir: args.inspect_spool_dir.clone(),
+                spool_max_bytes: args.inspect_spool_max_bytes,
+            });
 
             let ca =
                 match (&args.ca_cert, &args.ca_key) {
@@ -139,7 +166,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            proxy::run(&args.listen, ca, rules).await
+            proxy::run(&args.listen, ca, rules, inspect).await
         }
     }
 }
