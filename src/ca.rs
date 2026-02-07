@@ -43,6 +43,7 @@ pub fn generate_ca_to_files(
 
 pub struct CertificateAuthority {
     signer: Mutex<Signer>,
+    ca_cert_pem: String,
     ca_cert_der: CertificateDer<'static>,
     cache: tokio::sync::RwLock<HashMap<String, Arc<ServerConfig>>>,
 }
@@ -75,9 +76,18 @@ impl CertificateAuthority {
                 issuer_cert,
                 issuer_key,
             }),
+            ca_cert_pem: cert_pem,
             ca_cert_der,
             cache: tokio::sync::RwLock::new(HashMap::new()),
         })
+    }
+
+    pub fn ca_cert_pem(&self) -> &str {
+        &self.ca_cert_pem
+    }
+
+    pub fn ca_cert_der(&self) -> &[u8] {
+        self.ca_cert_der.as_ref()
     }
 
     pub async fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>> {

@@ -25,8 +25,68 @@ pub struct StatusRewriteRule {
 
 #[derive(Clone, Debug, Default)]
 pub struct Rules {
+    pub allowlist: Vec<AllowRule>,
     pub map_local: Vec<MapLocalRule>,
     pub status_rewrite: Vec<StatusRewriteRule>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AllowRule {
+    raw: String,
+}
+
+impl AllowRule {
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self { raw: raw.into() }
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn is_match(&self, scheme: &str, authority: &str, path_and_query: &str) -> bool {
+        let raw = self.raw.trim();
+        if raw.is_empty() {
+            return false;
+        }
+        if raw == "*" || raw == "*.*" {
+            return true;
+        }
+
+        let full = format!("{scheme}://{authority}{path_and_query}");
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            return full.starts_with(raw);
+        }
+        if raw.starts_with('/') {
+            return path_and_query.starts_with(raw);
+        }
+
+        let host = extract_host(authority);
+        let host_lc = host.to_ascii_lowercase();
+        let raw_lc = raw.to_ascii_lowercase();
+
+        if let Some(suffix) = raw_lc.strip_prefix("*.") {
+            return host_lc.ends_with(&format!(".{suffix}"));
+        }
+
+        if raw_lc.contains('/') {
+            let no_scheme = format!("{authority}{path_and_query}");
+            return no_scheme
+                .to_ascii_lowercase()
+                .starts_with(&raw_lc);
+        }
+
+        host_lc == raw_lc || host_lc.ends_with(&format!(".{raw_lc}"))
+    }
+}
+
+fn extract_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[')
+        && let Some(close) = rest.find(']')
+    {
+        return &rest[..close];
+    }
+    authority.split(':').next().unwrap_or(authority)
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +119,15 @@ impl Matcher {
 }
 
 impl Rules {
+    pub fn is_allowed(&self, scheme: &str, authority: &str, path_and_query: &str) -> bool {
+        if self.allowlist.is_empty() {
+            return true;
+        }
+        self.allowlist
+            .iter()
+            .any(|rule| rule.is_match(scheme, authority, path_and_query))
+    }
+
     pub fn find_map_local(
         &self,
         scheme: &str,
@@ -120,6 +189,7 @@ mod tests {
     #[test]
     fn rewrite_status_respects_optional_from() {
         let rules = Rules {
+            allowlist: vec![],
             map_local: vec![],
             status_rewrite: vec![
                 StatusRewriteRule {
@@ -140,5 +210,25 @@ mod tests {
 
         let rewritten = rules.rewrite_status("http", "example.com", "/api", StatusCode::CREATED);
         assert_eq!(rewritten, Some(StatusCode::IM_A_TEAPOT));
+    }
+
+    #[test]
+    fn allow_rule_matches_all_with_wildcard() {
+        let rule = AllowRule::new("*.*");
+        assert!(rule.is_match("https", "example.com", "/a"));
+    }
+
+    #[test]
+    fn allow_rule_matches_host_and_subdomains() {
+        let rule = AllowRule::new("naver.com");
+        assert!(rule.is_match("https", "naver.com", "/"));
+        assert!(rule.is_match("https", "api.naver.com", "/"));
+        assert!(!rule.is_match("https", "example.com", "/"));
+    }
+
+    #[test]
+    fn rules_default_allows_everything_without_allowlist() {
+        let rules = Rules::default();
+        assert!(rules.is_allowed("https", "example.com", "/"));
     }
 }

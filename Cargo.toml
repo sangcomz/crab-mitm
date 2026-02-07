@@ -3,8 +3,17 @@ name = "crab-mitm"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "crab_mitm"
+crate-type = ["staticlib", "lib"]
+
+[[bin]]
+name = "crab-mitm"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 bytes = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3"
@@ -22,7 +31,7 @@ rustls-native-certs = "0.8"
 rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }
 time = { version = "0.3", features = ["std"] }
-tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.9"
