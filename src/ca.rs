@@ -1,10 +1,11 @@
-use std::collections::HashMap;
 use std::io::BufReader;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use lru::LruCache;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use time::{Duration, OffsetDateTime};
@@ -69,7 +70,7 @@ pub struct CertificateAuthority {
     signer: Mutex<Signer>,
     ca_cert_pem: String,
     ca_cert_der: CertificateDer<'static>,
-    cache: tokio::sync::RwLock<HashMap<String, Arc<ServerConfig>>>,
+    cache: tokio::sync::Mutex<LruCache<String, Arc<ServerConfig>>>,
 }
 
 struct Signer {
@@ -102,7 +103,9 @@ impl CertificateAuthority {
             }),
             ca_cert_pem: cert_pem,
             ca_cert_der,
-            cache: tokio::sync::RwLock::new(HashMap::new()),
+            cache: tokio::sync::Mutex::new(LruCache::new(
+                NonZeroUsize::new(2048).expect("non-zero cert cache size"),
+            )),
         })
     }
 
@@ -116,13 +119,15 @@ impl CertificateAuthority {
 
     pub async fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>> {
         let host = normalize_host(host);
-
-        if let Some(cfg) = self.cache.read().await.get(&host).cloned() {
-            return Ok(cfg);
+        {
+            let mut cache = self.cache.lock().await;
+            if let Some(cfg) = cache.get(&host).cloned() {
+                return Ok(cfg);
+            }
         }
 
         let cfg = Arc::new(self.build_server_config(&host)?);
-        self.cache.write().await.insert(host, cfg.clone());
+        self.cache.lock().await.put(host, cfg.clone());
         Ok(cfg)
     }
 

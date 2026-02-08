@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 
@@ -53,6 +53,7 @@ impl LogCallback {
 
 static LOG_CALLBACK: OnceLock<RwLock<Option<LogCallback>>> = OnceLock::new();
 static LOG_INIT: Once = Once::new();
+static MAP_LOCAL_ALLOWED_ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
 fn ok_result() -> CrabResult {
     CrabResult {
@@ -71,6 +72,48 @@ fn err_result(code: i32, msg: &str) -> CrabResult {
 
 fn lock_err(name: &str) -> CrabResult {
     err_result(CRAB_ERR_INTERNAL, &format!("{name} lock poisoned"))
+}
+
+macro_rules! ffi_entry {
+    ($body:block) => {{
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> CrabResult { $body }));
+        result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+    }};
+}
+
+macro_rules! ffi_try {
+    ($expr:expr) => {
+        match $expr {
+            Ok(value) => value,
+            Err(result) => return result,
+        }
+    };
+}
+
+macro_rules! ffi_with_handle {
+    ($handle:expr, $h:ident, $body:block) => {{
+        let $h = ffi_try!(handle_ref($handle));
+        $body
+    }};
+}
+
+macro_rules! ffi_with_stopped_handle {
+    ($handle:expr, $h:ident, $body:block) => {{
+        ffi_with_handle!($handle, $h, {
+            ffi_try!(ensure_not_running($h));
+            $body
+        })
+    }};
+}
+
+macro_rules! ffi_lock {
+    ($mutex:expr, $name:literal) => {
+        match $mutex.lock() {
+            Ok(guard) => guard,
+            Err(_) => return lock_err($name),
+        }
+    };
 }
 
 unsafe fn cstr_to_string(ptr: *const c_char) -> Option<String> {
@@ -118,6 +161,118 @@ fn parse_status_code(raw: u16, arg_name: &str) -> Result<StatusCode, CrabResult>
             &format!("{arg_name} must be a valid HTTP status code"),
         )
     })
+}
+
+fn map_local_allowed_roots() -> &'static [PathBuf] {
+    MAP_LOCAL_ALLOWED_ROOTS
+        .get_or_init(compute_map_local_allowed_roots)
+        .as_slice()
+}
+
+fn compute_map_local_allowed_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(value) = std::env::var_os("CRAB_MAP_LOCAL_ALLOWED_ROOTS") {
+        for raw in std::env::split_paths(&value) {
+            if let Some(canonical) = canonical_root(&raw) {
+                roots.push(canonical);
+            }
+        }
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(canonical) = canonical_root(&cwd)
+    {
+        roots.push(canonical);
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && let Some(canonical) = canonical_root(&home)
+    {
+        roots.push(canonical);
+    }
+    if let Some(canonical) = canonical_root(&std::env::temp_dir()) {
+        roots.push(canonical);
+    }
+
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn canonical_root(path: &Path) -> Option<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Some(canonical),
+        Err(_) if path.is_absolute() => Some(path.to_path_buf()),
+        Err(_) => None,
+    }
+}
+
+fn validate_map_local_file_path(raw_path: &str) -> Result<PathBuf, CrabResult> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err(err_result(
+            CRAB_ERR_INVALID_ARG,
+            "file_path must not be empty",
+        ));
+    }
+
+    let path = PathBuf::from(trimmed);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(err_result(
+            CRAB_ERR_INVALID_ARG,
+            "file_path must not contain parent-directory traversals",
+        ));
+    }
+
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        let cwd = std::env::current_dir().map_err(|err| {
+            err_result(
+                CRAB_ERR_IO,
+                &format!("failed to resolve current directory: {err}"),
+            )
+        })?;
+        cwd.join(path)
+    };
+
+    let canonical = std::fs::canonicalize(&absolute).map_err(|err| {
+        err_result(
+            CRAB_ERR_INVALID_ARG,
+            &format!("file_path must reference an existing file: {err}"),
+        )
+    })?;
+
+    let metadata = std::fs::metadata(&canonical).map_err(|err| {
+        err_result(
+            CRAB_ERR_IO,
+            &format!("failed to read file metadata for map_local: {err}"),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(err_result(
+            CRAB_ERR_INVALID_ARG,
+            "file_path must reference a regular file",
+        ));
+    }
+
+    if !map_local_allowed_roots()
+        .iter()
+        .any(|allowed_root| canonical.starts_with(allowed_root))
+    {
+        return Err(err_result(
+            CRAB_ERR_INVALID_ARG,
+            "file_path is outside allowed map_local roots; set CRAB_MAP_LOCAL_ALLOWED_ROOTS to permit it",
+        ));
+    }
+
+    Ok(canonical)
 }
 
 fn stop_inner(handle: &CrabProxyHandle) -> Result<()> {
@@ -239,7 +394,7 @@ pub extern "C" fn crab_proxy_create(
     out_handle: *mut *mut CrabProxyHandle,
     listen_addr: *const c_char,
 ) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    ffi_entry!({
         if out_handle.is_null() {
             return err_result(CRAB_ERR_INVALID_ARG, "out_handle must not be null");
         }
@@ -283,9 +438,7 @@ pub extern "C" fn crab_proxy_create(
             *out_handle = Box::into_raw(boxed);
         }
         ok_result()
-    }));
-
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -293,63 +446,41 @@ pub extern "C" fn crab_proxy_set_listen_addr(
     handle: *mut CrabProxyHandle,
     listen_addr: *const c_char,
 ) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
-
-        if h.running.load(Ordering::SeqCst) {
-            return err_result(CRAB_ERR_STATE, "proxy is running");
-        }
-
-        let listen = match unsafe { require_cstr(listen_addr, "listen_addr") } {
-            Ok(s) => s,
-            Err(r) => return r,
-        };
-
-        match h.listen_addr.lock() {
-            Ok(mut guard) => {
-                *guard = listen;
-                ok_result()
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            if h.running.load(Ordering::SeqCst) {
+                return err_result(CRAB_ERR_STATE, "proxy is running");
             }
-            Err(_) => lock_err("listen_addr"),
-        }
-    }));
 
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+            let listen = ffi_try!(unsafe { require_cstr(listen_addr, "listen_addr") });
+            let mut guard = ffi_lock!(h.listen_addr, "listen_addr");
+            *guard = listen;
+            ok_result()
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn crab_proxy_set_port(handle: *mut CrabProxyHandle, port: u16) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    ffi_entry!({
         if port == 0 {
             return err_result(CRAB_ERR_INVALID_ARG, "port must be > 0");
         }
 
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
-
-        if h.running.load(Ordering::SeqCst) {
-            return err_result(CRAB_ERR_STATE, "proxy is running");
-        }
-
-        match h.listen_addr.lock() {
-            Ok(mut guard) => {
-                let host = guard
-                    .rsplit_once(':')
-                    .map(|(h, _)| h.to_string())
-                    .unwrap_or_else(|| "127.0.0.1".to_string());
-                *guard = format!("{host}:{port}");
-                ok_result()
+        ffi_with_handle!(handle, h, {
+            if h.running.load(Ordering::SeqCst) {
+                return err_result(CRAB_ERR_STATE, "proxy is running");
             }
-            Err(_) => lock_err("listen_addr"),
-        }
-    }));
 
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+            let mut guard = ffi_lock!(h.listen_addr, "listen_addr");
+            let host = guard
+                .rsplit_once(':')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            *guard = format!("{host}:{port}");
+            ok_result()
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -358,34 +489,21 @@ pub extern "C" fn crab_proxy_load_ca(
     cert_path: *const c_char,
     key_path: *const c_char,
 ) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            let cert = ffi_try!(unsafe { require_cstr(cert_path, "cert_path") });
+            let key = ffi_try!(unsafe { require_cstr(key_path, "key_path") });
 
-        let cert = match unsafe { require_cstr(cert_path, "cert_path") } {
-            Ok(s) => s,
-            Err(r) => return r,
-        };
-        let key = match unsafe { require_cstr(key_path, "key_path") } {
-            Ok(s) => s,
-            Err(r) => return r,
-        };
-
-        match CertificateAuthority::from_pem_files(cert.as_ref(), key.as_ref()) {
-            Ok(ca) => match h.ca.lock() {
-                Ok(mut guard) => {
+            match CertificateAuthority::from_pem_files(cert.as_ref(), key.as_ref()) {
+                Ok(ca) => {
+                    let mut guard = ffi_lock!(h.ca, "ca");
                     *guard = Some(Arc::new(ca));
                     ok_result()
                 }
-                Err(_) => lock_err("ca"),
-            },
-            Err(err) => err_result(CRAB_ERR_CA, &format!("{err:#}")),
-        }
-    }));
-
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+                Err(err) => err_result(CRAB_ERR_CA, &format!("{err:#}")),
+            }
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -393,47 +511,26 @@ pub extern "C" fn crab_proxy_set_inspect_enabled(
     handle: *mut CrabProxyHandle,
     enabled: bool,
 ) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
-
-        match h.inspect.lock() {
-            Ok(mut guard) => {
-                guard.enabled = enabled;
-                ok_result()
-            }
-            Err(_) => lock_err("inspect"),
-        }
-    }));
-
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.inspect, "inspect");
+            guard.enabled = enabled;
+            ok_result()
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn crab_proxy_rules_clear(handle: *mut CrabProxyHandle) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
-        if let Err(r) = ensure_not_running(h) {
-            return r;
-        }
-
-        match h.rules.lock() {
-            Ok(mut guard) => {
-                guard.allowlist.clear();
-                guard.map_local.clear();
-                guard.status_rewrite.clear();
-                ok_result()
-            }
-            Err(_) => lock_err("rules"),
-        }
-    }));
-
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+    ffi_entry!({
+        ffi_with_stopped_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.rules, "rules");
+            guard.allowlist.clear();
+            guard.map_local.clear();
+            guard.status_rewrite.clear();
+            ok_result()
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -441,35 +538,19 @@ pub extern "C" fn crab_proxy_rules_add_allow(
     handle: *mut CrabProxyHandle,
     matcher: *const c_char,
 ) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
-        if let Err(r) = ensure_not_running(h) {
-            return r;
-        }
-
-        let matcher = match unsafe { require_cstr(matcher, "matcher") } {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-
-        let matcher = matcher.trim();
-        if matcher.is_empty() {
-            return err_result(CRAB_ERR_INVALID_ARG, "matcher must not be empty");
-        }
-
-        match h.rules.lock() {
-            Ok(mut guard) => {
-                guard.allowlist.push(AllowRule::new(matcher));
-                ok_result()
+    ffi_entry!({
+        ffi_with_stopped_handle!(handle, h, {
+            let matcher = ffi_try!(unsafe { require_cstr(matcher, "matcher") });
+            let matcher = matcher.trim();
+            if matcher.is_empty() {
+                return err_result(CRAB_ERR_INVALID_ARG, "matcher must not be empty");
             }
-            Err(_) => lock_err("rules"),
-        }
-    }));
 
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+            let mut guard = ffi_lock!(h.rules, "rules");
+            guard.allowlist.push(AllowRule::new(matcher));
+            ok_result()
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -480,44 +561,24 @@ pub extern "C" fn crab_proxy_rules_add_map_local_file(
     status_code: u16,
     content_type: *const c_char,
 ) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
-        if let Err(r) = ensure_not_running(h) {
-            return r;
-        }
+    ffi_entry!({
+        ffi_with_stopped_handle!(handle, h, {
+            let matcher = ffi_try!(unsafe { require_cstr(matcher, "matcher") });
+            let file_path = ffi_try!(unsafe { require_cstr(file_path, "file_path") });
+            let file_path = ffi_try!(validate_map_local_file_path(&file_path));
+            let status = ffi_try!(parse_status_code(status_code, "status_code"));
+            let content_type = unsafe { cstr_to_string(content_type) };
 
-        let matcher = match unsafe { require_cstr(matcher, "matcher") } {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        let file_path = match unsafe { require_cstr(file_path, "file_path") } {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        let status = match parse_status_code(status_code, "status_code") {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        let content_type = unsafe { cstr_to_string(content_type) };
-
-        match h.rules.lock() {
-            Ok(mut guard) => {
-                guard.map_local.push(MapLocalRule {
-                    matcher: Matcher::new(matcher),
-                    source: MapSource::File(PathBuf::from(file_path)),
-                    status,
-                    content_type,
-                });
-                ok_result()
-            }
-            Err(_) => lock_err("rules"),
-        }
-    }));
-
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+            let mut guard = ffi_lock!(h.rules, "rules");
+            guard.map_local.push(MapLocalRule {
+                matcher: Matcher::new(matcher),
+                source: MapSource::File(file_path),
+                status,
+                content_type,
+            });
+            ok_result()
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -528,44 +589,23 @@ pub extern "C" fn crab_proxy_rules_add_map_local_text(
     status_code: u16,
     content_type: *const c_char,
 ) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
-        if let Err(r) = ensure_not_running(h) {
-            return r;
-        }
+    ffi_entry!({
+        ffi_with_stopped_handle!(handle, h, {
+            let matcher = ffi_try!(unsafe { require_cstr(matcher, "matcher") });
+            let text = ffi_try!(unsafe { require_cstr(text, "text") });
+            let status = ffi_try!(parse_status_code(status_code, "status_code"));
+            let content_type = unsafe { cstr_to_string(content_type) };
 
-        let matcher = match unsafe { require_cstr(matcher, "matcher") } {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        let text = match unsafe { require_cstr(text, "text") } {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        let status = match parse_status_code(status_code, "status_code") {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        let content_type = unsafe { cstr_to_string(content_type) };
-
-        match h.rules.lock() {
-            Ok(mut guard) => {
-                guard.map_local.push(MapLocalRule {
-                    matcher: Matcher::new(matcher),
-                    source: MapSource::Text(text),
-                    status,
-                    content_type,
-                });
-                ok_result()
-            }
-            Err(_) => lock_err("rules"),
-        }
-    }));
-
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+            let mut guard = ffi_lock!(h.rules, "rules");
+            guard.map_local.push(MapLocalRule {
+                matcher: Matcher::new(matcher),
+                source: MapSource::Text(text),
+                status,
+                content_type,
+            });
+            ok_result()
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -575,139 +615,91 @@ pub extern "C" fn crab_proxy_rules_add_status_rewrite(
     from_status_code: i32,
     to_status_code: u16,
 ) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
-        if let Err(r) = ensure_not_running(h) {
-            return r;
-        }
-
-        let matcher = match unsafe { require_cstr(matcher, "matcher") } {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        let to_status = match parse_status_code(to_status_code, "to_status_code") {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        let from_status = if from_status_code < 0 {
-            None
-        } else {
-            let raw = match u16::try_from(from_status_code) {
-                Ok(v) => v,
-                Err(_) => {
-                    return err_result(
-                        CRAB_ERR_INVALID_ARG,
-                        "from_status_code must be negative (any) or valid HTTP status",
-                    );
-                }
+    ffi_entry!({
+        ffi_with_stopped_handle!(handle, h, {
+            let matcher = ffi_try!(unsafe { require_cstr(matcher, "matcher") });
+            let to_status = ffi_try!(parse_status_code(to_status_code, "to_status_code"));
+            let from_status = if from_status_code < 0 {
+                None
+            } else {
+                let raw = match u16::try_from(from_status_code) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return err_result(
+                            CRAB_ERR_INVALID_ARG,
+                            "from_status_code must be negative (any) or valid HTTP status",
+                        );
+                    }
+                };
+                Some(ffi_try!(parse_status_code(raw, "from_status_code")))
             };
-            match parse_status_code(raw, "from_status_code") {
-                Ok(v) => Some(v),
-                Err(r) => return r,
-            }
-        };
 
-        match h.rules.lock() {
-            Ok(mut guard) => {
-                guard.status_rewrite.push(StatusRewriteRule {
-                    matcher: Matcher::new(matcher),
-                    from: from_status,
-                    to: to_status,
-                });
-                ok_result()
-            }
-            Err(_) => lock_err("rules"),
-        }
-    }));
-
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+            let mut guard = ffi_lock!(h.rules, "rules");
+            guard.status_rewrite.push(StatusRewriteRule {
+                matcher: Matcher::new(matcher),
+                from: from_status,
+                to: to_status,
+            });
+            ok_result()
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn crab_proxy_start(handle: *mut CrabProxyHandle) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            if h.running.load(Ordering::SeqCst) {
+                return err_result(CRAB_ERR_STATE, "proxy is already running");
+            }
 
-        if h.running.load(Ordering::SeqCst) {
-            return err_result(CRAB_ERR_STATE, "proxy is already running");
-        }
+            // Reap previous task if it exists.
+            let prior_task = {
+                let mut guard = ffi_lock!(h.task, "task");
+                guard.take()
+            };
+            if let Some(task) = prior_task {
+                let _ = h.runtime.block_on(task);
+            }
 
-        // Reap previous task if it exists.
-        let prior_task = match h.task.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(_) => return lock_err("task"),
-        };
-        if let Some(task) = prior_task {
-            let _ = h.runtime.block_on(task);
-        }
+            let listen = ffi_lock!(h.listen_addr, "listen_addr").clone();
+            let ca = ffi_lock!(h.ca, "ca").clone();
+            let rules = Arc::new(ffi_lock!(h.rules, "rules").clone());
+            let inspect = Arc::new(ffi_lock!(h.inspect, "inspect").clone());
 
-        let listen = match h.listen_addr.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => return lock_err("listen_addr"),
-        };
-        let ca = match h.ca.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => return lock_err("ca"),
-        };
-        let rules = match h.rules.lock() {
-            Ok(guard) => Arc::new(guard.clone()),
-            Err(_) => return lock_err("rules"),
-        };
-        let inspect = match h.inspect.lock() {
-            Ok(guard) => Arc::new(guard.clone()),
-            Err(_) => return lock_err("inspect"),
-        };
-
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        match h.shutdown_tx.lock() {
-            Ok(mut guard) => {
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            {
+                let mut guard = ffi_lock!(h.shutdown_tx, "shutdown_tx");
                 *guard = Some(shutdown_tx);
             }
-            Err(_) => return lock_err("shutdown_tx"),
-        }
 
-        let running = h.running.clone();
-        running.store(true, Ordering::SeqCst);
+            let running = h.running.clone();
+            running.store(true, Ordering::SeqCst);
 
-        let task = h.runtime.spawn(async move {
-            let result = proxy::run_with_shutdown(&listen, ca, rules, inspect, shutdown_rx).await;
-            running.store(false, Ordering::SeqCst);
-            result
-        });
+            let task = h.runtime.spawn(async move {
+                let result =
+                    proxy::run_with_shutdown(&listen, ca, rules, inspect, shutdown_rx).await;
+                running.store(false, Ordering::SeqCst);
+                result
+            });
 
-        match h.task.lock() {
-            Ok(mut guard) => {
-                *guard = Some(task);
-                ok_result()
-            }
-            Err(_) => lock_err("task"),
-        }
-    }));
-
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+            let mut guard = ffi_lock!(h.task, "task");
+            *guard = Some(task);
+            ok_result()
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn crab_proxy_stop(handle: *mut CrabProxyHandle) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let h = match handle_ref(handle) {
-            Ok(h) => h,
-            Err(r) => return r,
-        };
-
-        match stop_inner(h) {
-            Ok(()) => ok_result(),
-            Err(err) => err_result(CRAB_ERR_IO, &format!("{err:#}")),
-        }
-    }));
-
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            match stop_inner(h) {
+                Ok(()) => ok_result(),
+                Err(err) => err_result(CRAB_ERR_IO, &format!("{err:#}")),
+            }
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -743,25 +735,14 @@ pub extern "C" fn crab_ca_generate(
     out_cert: *const c_char,
     out_key: *const c_char,
 ) -> CrabResult {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let common_name = match unsafe { require_cstr(common_name, "common_name") } {
-            Ok(s) => s,
-            Err(r) => return r,
-        };
-        let out_cert = match unsafe { require_cstr(out_cert, "out_cert") } {
-            Ok(s) => PathBuf::from(s),
-            Err(r) => return r,
-        };
-        let out_key = match unsafe { require_cstr(out_key, "out_key") } {
-            Ok(s) => PathBuf::from(s),
-            Err(r) => return r,
-        };
+    ffi_entry!({
+        let common_name = ffi_try!(unsafe { require_cstr(common_name, "common_name") });
+        let out_cert = PathBuf::from(ffi_try!(unsafe { require_cstr(out_cert, "out_cert") }));
+        let out_key = PathBuf::from(ffi_try!(unsafe { require_cstr(out_key, "out_key") }));
 
         match ca::generate_ca_to_files(&common_name, days, &out_cert, &out_key) {
             Ok(()) => ok_result(),
             Err(err) => err_result(CRAB_ERR_CA, &format!("{err:#}")),
         }
-    }));
-
-    result.unwrap_or_else(|_| err_result(CRAB_ERR_INTERNAL, "internal panic"))
+    })
 }

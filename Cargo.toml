@@ -23,6 +23,7 @@ http-body-util = "0.1"
 hyper = { version = "1.7", features = ["full"] }
 hyper-rustls = { version = "0.27", features = ["http1", "native-tokio"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+lru = "0.12"
 mime_guess = "2.0"
 pin-project-lite = "0.2"
 rcgen = { version = "0.13", features = ["x509-parser"] }

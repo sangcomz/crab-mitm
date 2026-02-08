@@ -1,22 +1,15 @@
 use std::convert::Infallible;
 use std::error::Error as StdError;
-use std::fs::{self, File};
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context as TaskContext, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::header::{HOST, HeaderName, HeaderValue};
 use http::{HeaderMap, Method, StatusCode, Uri};
-use http_body::{Body as HttpBody, Frame, SizeHint};
+use http_body::{Body as HttpBody, Frame};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Incoming;
@@ -26,7 +19,6 @@ use hyper::upgrade;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use pin_project_lite::pin_project;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -36,10 +28,18 @@ use tokio_util::io::ReaderStream;
 use crate::ca::CertificateAuthority;
 use crate::rules::{MapSource, Rules};
 
-static NEXT_SPOOL_FILE_ID: AtomicU64 = AtomicU64::new(1);
+mod cert_portal;
+mod inspect;
+mod response;
 
-const PREVIEW_LOG_LIMIT_BYTES: usize = 512;
-const CERT_PORTAL_HOSTS: [&str; 3] = ["crab-proxy.local", "crab-proxy.invalid", "proxy.crab"];
+use cert_portal::maybe_handle_cert_portal;
+use inspect::{InspectMeta, encode_headers_for_log, maybe_inspect_body};
+use response::{apply_content_headers, text_response};
+
+#[cfg(test)]
+use cert_portal::{build_cert_portal_page, build_ios_mobileconfig, is_cert_portal_host};
+#[cfg(test)]
+use inspect::{BodyInspector, escape_for_log};
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -66,219 +66,6 @@ struct ProxyState {
 struct RequestContext {
     default_scheme: &'static str,
     default_authority: Option<String>,
-}
-
-#[derive(Clone)]
-struct InspectMeta {
-    direction: &'static str,
-    peer: SocketAddr,
-    method: Method,
-    url: String,
-    response_status: Option<StatusCode>,
-}
-
-struct BodyInspector {
-    meta: InspectMeta,
-    sample: Vec<u8>,
-    sample_limit: usize,
-    sample_truncated: bool,
-    total_bytes: u64,
-    spool_file: Option<File>,
-    spool_path: Option<PathBuf>,
-    spool_max_bytes: u64,
-    spool_written: u64,
-    spool_truncated: bool,
-    spool_error: Option<String>,
-}
-
-pin_project! {
-    struct InspectableBody<B> {
-        #[pin]
-        inner: B,
-        inspector: Option<BodyInspector>,
-    }
-}
-
-impl<B> InspectableBody<B> {
-    fn new(inner: B, inspector: BodyInspector) -> Self {
-        Self {
-            inner,
-            inspector: Some(inspector),
-        }
-    }
-}
-
-impl<B> HttpBody for InspectableBody<B>
-where
-    B: HttpBody<Data = Bytes>,
-    B::Error: StdError,
-{
-    type Data = Bytes;
-    type Error = B::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.project();
-
-        match this.inner.poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref()
-                    && let Some(inspector) = this.inspector.as_mut()
-                {
-                    inspector.observe(data);
-                }
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(Some(Err(err))) => {
-                let error_message = err.to_string();
-                if let Some(inspector) = this.inspector.take() {
-                    inspector.finish("error", Some(error_message));
-                }
-                Poll::Ready(Some(Err(err)))
-            }
-            Poll::Ready(None) => {
-                if let Some(inspector) = this.inspector.take() {
-                    inspector.finish("complete", None);
-                }
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl BodyInspector {
-    fn new(cfg: &InspectConfig, meta: InspectMeta) -> Self {
-        let mut inspector = Self {
-            meta,
-            sample: Vec::new(),
-            sample_limit: cfg.sample_bytes,
-            sample_truncated: false,
-            total_bytes: 0,
-            spool_file: None,
-            spool_path: None,
-            spool_max_bytes: cfg.spool_max_bytes,
-            spool_written: 0,
-            spool_truncated: false,
-            spool_error: None,
-        };
-
-        if cfg.spool {
-            match open_spool_file(cfg, inspector.meta.direction) {
-                Ok((path, file)) => {
-                    inspector.spool_path = Some(path);
-                    inspector.spool_file = Some(file);
-                }
-                Err(err) => {
-                    inspector.spool_error = Some(err.to_string());
-                    tracing::warn!(
-                        peer = %inspector.meta.peer,
-                        method = %inspector.meta.method,
-                        url = %inspector.meta.url,
-                        direction = inspector.meta.direction,
-                        error = %err,
-                        "failed to open body spool file"
-                    );
-                }
-            }
-        }
-
-        inspector
-    }
-
-    fn observe(&mut self, bytes: &[u8]) {
-        self.total_bytes += bytes.len() as u64;
-
-        if self.sample.len() < self.sample_limit {
-            let remaining = self.sample_limit - self.sample.len();
-            let take = remaining.min(bytes.len());
-            self.sample.extend_from_slice(&bytes[..take]);
-            if bytes.len() > take {
-                self.sample_truncated = true;
-            }
-        } else if !bytes.is_empty() {
-            self.sample_truncated = true;
-        }
-
-        if self.spool_file.is_some() {
-            if self.spool_written >= self.spool_max_bytes {
-                self.spool_truncated = true;
-                return;
-            }
-
-            let remaining = (self.spool_max_bytes - self.spool_written) as usize;
-            let write_len = remaining.min(bytes.len());
-
-            if write_len > 0 {
-                let write_result = self
-                    .spool_file
-                    .as_mut()
-                    .expect("spool_file checked")
-                    .write_all(&bytes[..write_len]);
-                if let Err(err) = write_result {
-                    self.spool_error = Some(err.to_string());
-                    self.spool_file = None;
-                    return;
-                }
-                self.spool_written += write_len as u64;
-            }
-
-            if bytes.len() > write_len {
-                self.spool_truncated = true;
-            }
-        }
-    }
-
-    fn finish(mut self, outcome: &'static str, error: Option<String>) {
-        if let Some(file) = self.spool_file.as_mut()
-            && let Err(err) = file.flush()
-            && self.spool_error.is_none()
-        {
-            self.spool_error = Some(err.to_string());
-        }
-
-        let preview_source_len = self.sample.len().min(PREVIEW_LOG_LIMIT_BYTES);
-        let sample_preview = escape_for_log(&self.sample[..preview_source_len]);
-        let sample_preview_truncated = self.sample.len() > PREVIEW_LOG_LIMIT_BYTES;
-        let sample_b64 = base64::engine::general_purpose::STANDARD.encode(&self.sample);
-
-        let spool_path = self
-            .spool_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "-".to_string());
-
-        tracing::info!(
-            peer = %self.meta.peer,
-            method = %self.meta.method,
-            url = %self.meta.url,
-            direction = self.meta.direction,
-            response_status = ?self.meta.response_status,
-            body_bytes = self.total_bytes,
-            sample_bytes = self.sample.len(),
-            sample_truncated = self.sample_truncated,
-            sample_preview = %sample_preview,
-            sample_b64 = %sample_b64,
-            sample_preview_truncated = sample_preview_truncated,
-            spool_path = %spool_path,
-            spool_bytes = self.spool_written,
-            spool_truncated = self.spool_truncated,
-            spool_error = %self.spool_error.as_deref().unwrap_or("-"),
-            outcome = outcome,
-            error = %error.as_deref().unwrap_or("-"),
-            "body inspection"
-        );
-    }
 }
 
 pub async fn run(
@@ -391,7 +178,7 @@ async fn handle_request(
         Ok(resp) => resp,
         Err(err) => {
             tracing::warn!(peer = %peer, error = %err, "request failed");
-            text_response(StatusCode::BAD_GATEWAY, format!("bad gateway: {err}\n"))
+            text_response(StatusCode::BAD_GATEWAY, "bad gateway\n".to_string())
         }
     }
 }
@@ -528,7 +315,11 @@ async fn proxy_http(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let request_url = format!("{}://{}{}", target.scheme, target.authority, path_and_query);
+    let request_url: Arc<str> = Arc::from(format!(
+        "{}://{}{}",
+        target.scheme, target.authority, path_and_query
+    ));
+    let method_for_inspect: Arc<str> = Arc::from(method.as_str());
 
     tracing::debug!(
         peer = %peer,
@@ -590,7 +381,7 @@ async fn proxy_http(
     let inspect_req_meta = InspectMeta {
         direction: "request",
         peer,
-        method: method.clone(),
+        method: method_for_inspect.clone(),
         url: request_url.clone(),
         response_status: None,
     };
@@ -631,7 +422,7 @@ async fn proxy_http(
     let inspect_resp_meta = InspectMeta {
         direction: "response",
         peer,
-        method: method.clone(),
+        method: method_for_inspect,
         url: request_url.clone(),
         response_status: Some(upstream_status),
     };
@@ -768,18 +559,6 @@ fn apply_status_rewrite<B>(
     }
 }
 
-fn maybe_inspect_body<B>(body: B, cfg: &InspectConfig, meta: InspectMeta) -> ProxyBody
-where
-    B: HttpBody<Data = Bytes> + Send + 'static,
-    B::Error: StdError + Send + Sync + 'static,
-{
-    if cfg.enabled {
-        boxed_body(InspectableBody::new(body, BodyInspector::new(cfg, meta)))
-    } else {
-        boxed_body(body)
-    }
-}
-
 fn boxed_body<B>(body: B) -> ProxyBody
 where
     B: HttpBody<Data = Bytes> + Send + 'static,
@@ -823,411 +602,11 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
     }
 }
 
-fn maybe_handle_cert_portal(
-    method: &Method,
-    target: &ResolvedTarget,
-    ca: Option<&CertificateAuthority>,
-) -> Option<hyper::Response<ProxyBody>> {
-    if target.scheme != "http" {
-        return None;
-    }
-
-    let host = target.uri.host()?;
-    if !is_cert_portal_host(host) {
-        return None;
-    }
-
-    if *method != Method::GET && *method != Method::HEAD {
-        return Some(maybe_head_response(
-            method,
-            text_response(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "only GET/HEAD is supported for cert portal\n".to_string(),
-            ),
-        ));
-    }
-
-    let path = target.uri.path();
-    let base_url = format!("http://{}", target.authority);
-
-    match path {
-        "/" | "/index.html" => Some(maybe_head_response(
-            method,
-            html_response(
-                StatusCode::OK,
-                build_cert_portal_page(&base_url, ca.is_some()),
-            ),
-        )),
-        "/ca.pem" => {
-            let Some(ca) = ca else {
-                return Some(maybe_head_response(
-                    method,
-                    text_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "CA is not loaded. Configure CA in the desktop app first.\n".to_string(),
-                    ),
-                ));
-            };
-            let mut resp = bytes_response(
-                StatusCode::OK,
-                "application/x-pem-file",
-                Bytes::from(ca.ca_cert_pem().to_string()),
-            );
-            resp.headers_mut().insert(
-                http::header::CONTENT_DISPOSITION,
-                HeaderValue::from_static("attachment; filename=\"crab-proxy-ca.pem\""),
-            );
-            Some(maybe_head_response(method, resp))
-        }
-        "/android.crt" | "/ca.der" => {
-            let Some(ca) = ca else {
-                return Some(maybe_head_response(
-                    method,
-                    text_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "CA is not loaded. Configure CA in the desktop app first.\n".to_string(),
-                    ),
-                ));
-            };
-            let mut resp = bytes_response(
-                StatusCode::OK,
-                "application/x-x509-ca-cert",
-                Bytes::copy_from_slice(ca.ca_cert_der()),
-            );
-            resp.headers_mut().insert(
-                http::header::CONTENT_DISPOSITION,
-                HeaderValue::from_static("attachment; filename=\"crab-proxy-ca.crt\""),
-            );
-            Some(maybe_head_response(method, resp))
-        }
-        "/ios.mobileconfig" => {
-            let Some(ca) = ca else {
-                return Some(maybe_head_response(
-                    method,
-                    text_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "CA is not loaded. Configure CA in the desktop app first.\n".to_string(),
-                    ),
-                ));
-            };
-            let mobileconfig = build_ios_mobileconfig(ca.ca_cert_der());
-            let mut resp = bytes_response(
-                StatusCode::OK,
-                "application/x-apple-aspen-config",
-                Bytes::from(mobileconfig),
-            );
-            resp.headers_mut().insert(
-                http::header::CONTENT_DISPOSITION,
-                HeaderValue::from_static("attachment; filename=\"crab-proxy-ca.mobileconfig\""),
-            );
-            Some(maybe_head_response(method, resp))
-        }
-        _ => Some(maybe_head_response(
-            method,
-            text_response(
-                StatusCode::NOT_FOUND,
-                "cert portal path not found\n".to_string(),
-            ),
-        )),
-    }
-}
-
-fn is_cert_portal_host(host: &str) -> bool {
-    CERT_PORTAL_HOSTS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(host))
-}
-
-fn build_cert_portal_page(base_url: &str, has_ca: bool) -> String {
-    let ca_section = if has_ca {
-        format!(
-            r#"
-<div class="card">
-  <h2>Install Certificate</h2>
-  <p><b>Android:</b> download and install <a href="{base}/android.crt">android.crt</a></p>
-  <p><b>iOS:</b> download and install <a href="{base}/ios.mobileconfig">ios.mobileconfig</a></p>
-  <p><b>Raw PEM:</b> <a href="{base}/ca.pem">ca.pem</a></p>
-  <p class="note">iOS requires extra trust step:
-  Settings &gt; General &gt; About &gt; Certificate Trust Settings.</p>
-</div>
-"#,
-            base = base_url
-        )
-    } else {
-        r#"
-<div class="card">
-  <h2>CA Not Loaded</h2>
-  <p>The proxy is running, but no CA certificate is configured yet.</p>
-  <p>Load or generate CA files from the desktop app first.</p>
-</div>
-"#
-        .to_string()
-    };
-
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Crab Proxy Cert Portal</title>
-  <style>
-    body {{
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: #e9f2ff;
-      background: linear-gradient(135deg, #06203a 0%, #0d3a33 100%);
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 16px;
-    }}
-    .wrap {{
-      width: min(760px, 100%);
-    }}
-    .title {{
-      font-size: 30px;
-      font-weight: 700;
-      margin-bottom: 8px;
-    }}
-    .subtitle {{
-      color: #b8cee8;
-      margin-bottom: 16px;
-    }}
-    .card {{
-      border: 1px solid rgba(255, 255, 255, 0.2);
-      border-radius: 16px;
-      background: rgba(8, 14, 24, 0.35);
-      padding: 16px;
-      backdrop-filter: blur(8px);
-    }}
-    h2 {{
-      margin-top: 0;
-      font-size: 20px;
-    }}
-    p {{
-      line-height: 1.5;
-      margin: 8px 0;
-    }}
-    a {{
-      color: #88d9ff;
-      text-decoration: none;
-    }}
-    .note {{
-      color: #d6e8ff;
-      opacity: 0.9;
-      font-size: 14px;
-      margin-top: 12px;
-    }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="title">Crab Proxy Certificate Portal</div>
-    <div class="subtitle">Open this page from a phone browser while HTTP proxy is enabled.</div>
-    {ca_section}
-  </div>
-</body>
-</html>"#
-    )
-}
-
-fn build_ios_mobileconfig(ca_der: &[u8]) -> String {
-    let cert_b64 = base64::engine::general_purpose::STANDARD.encode(ca_der);
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>PayloadContent</key>
-  <array>
-    <dict>
-      <key>PayloadCertificateFileName</key>
-      <string>crab-proxy-ca.cer</string>
-      <key>PayloadContent</key>
-      <data>{cert_b64}</data>
-      <key>PayloadDescription</key>
-      <string>Installs Crab Proxy root certificate.</string>
-      <key>PayloadDisplayName</key>
-      <string>Crab Proxy Root CA</string>
-      <key>PayloadIdentifier</key>
-      <string>com.crabproxy.ca.root</string>
-      <key>PayloadType</key>
-      <string>com.apple.security.root</string>
-      <key>PayloadUUID</key>
-      <string>8891AB7E-3E52-47F4-8A0A-9A4A6D4FAF11</string>
-      <key>PayloadVersion</key>
-      <integer>1</integer>
-    </dict>
-  </array>
-  <key>PayloadDescription</key>
-  <string>Install this profile to trust Crab Proxy for HTTPS inspection.</string>
-  <key>PayloadDisplayName</key>
-  <string>Crab Proxy CA</string>
-  <key>PayloadIdentifier</key>
-  <string>com.crabproxy.ca.profile</string>
-  <key>PayloadOrganization</key>
-  <string>Crab Proxy</string>
-  <key>PayloadRemovalDisallowed</key>
-  <false/>
-  <key>PayloadType</key>
-  <string>Configuration</string>
-  <key>PayloadUUID</key>
-  <string>778E1AF7-EB28-4B8D-92A0-0295A53D5C72</string>
-  <key>PayloadVersion</key>
-  <integer>1</integer>
-</dict>
-</plist>"#
-    )
-}
-
-fn maybe_head_response(
-    method: &Method,
-    mut resp: hyper::Response<ProxyBody>,
-) -> hyper::Response<ProxyBody> {
-    if *method == Method::HEAD {
-        *resp.body_mut() = boxed_body(Full::new(Bytes::new()));
-    }
-    resp
-}
-
-fn text_response(status: StatusCode, body: String) -> hyper::Response<ProxyBody> {
-    let bytes = Bytes::from(body);
-    let mut resp = hyper::Response::new(boxed_body(Full::new(bytes.clone())));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    resp.headers_mut().insert(
-        http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&bytes.len().to_string()).expect("content-length"),
-    );
-    resp
-}
-
-fn html_response(status: StatusCode, html: String) -> hyper::Response<ProxyBody> {
-    let bytes = Bytes::from(html);
-    let mut resp = hyper::Response::new(boxed_body(Full::new(bytes.clone())));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    resp.headers_mut().insert(
-        http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&bytes.len().to_string()).expect("content-length"),
-    );
-    resp
-}
-
-fn bytes_response(
-    status: StatusCode,
-    content_type: &'static str,
-    body: Bytes,
-) -> hyper::Response<ProxyBody> {
-    let mut resp = hyper::Response::new(boxed_body(Full::new(body.clone())));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type),
-    );
-    resp.headers_mut().insert(
-        http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body.len().to_string()).expect("content-length"),
-    );
-    resp
-}
-
-fn apply_content_headers(
-    headers: &mut HeaderMap,
-    content_type: &str,
-    content_length: Option<u64>,
-) -> Result<()> {
-    headers.insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_str(content_type).context("invalid content_type")?,
-    );
-
-    if let Some(len) = content_length {
-        headers.insert(
-            http::header::CONTENT_LENGTH,
-            HeaderValue::from_str(&len.to_string()).context("invalid content-length")?,
-        );
-    }
-
-    Ok(())
-}
-
-fn open_spool_file(cfg: &InspectConfig, direction: &str) -> std::io::Result<(PathBuf, File)> {
-    let dir = cfg.spool_dir.clone().unwrap_or_else(std::env::temp_dir);
-    fs::create_dir_all(&dir)?;
-    set_spool_dir_permissions(&dir)?;
-
-    let now_millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let id = NEXT_SPOOL_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!("crab-mitm-{direction}-{now_millis}-{id}.bin"));
-    let file = create_private_spool_file(&path)?;
-
-    Ok((path, file))
-}
-
-fn set_spool_dir_permissions(path: &PathBuf) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn create_private_spool_file(path: &PathBuf) -> std::io::Result<File> {
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        return OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path);
-    }
-
-    #[cfg(not(unix))]
-    {
-        File::create(path)
-    }
-}
-
-fn escape_for_log(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    for byte in bytes {
-        for escaped in std::ascii::escape_default(*byte) {
-            out.push(char::from(escaped));
-        }
-    }
-    out
-}
-
-fn encode_headers_for_log(headers: &HeaderMap) -> String {
-    let mut plain = String::new();
-    for (name, value) in headers {
-        plain.push_str(name.as_str());
-        plain.push_str(": ");
-        plain.push_str(value.to_str().unwrap_or("<non-utf8>"));
-        plain.push('\n');
-    }
-    base64::engine::general_purpose::STANDARD.encode(plain.as_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    use base64::Engine as _;
 
     use super::*;
 
@@ -1235,8 +614,8 @@ mod tests {
         InspectMeta {
             direction: "request",
             peer: "127.0.0.1:12345".parse().expect("socket addr"),
-            method: Method::POST,
-            url: "http://example.com/upload".to_string(),
+            method: Arc::from("POST"),
+            url: Arc::from("http://example.com/upload"),
             response_status: None,
         }
     }
