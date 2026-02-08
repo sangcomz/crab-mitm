@@ -9,11 +9,13 @@ Rust로 만든 간단한 MITM 프록시(HTTP/HTTPS)입니다. 네트워크 디�
 - 업스트림 request/response body 스트리밍 전달 (대용량 대응)
 - 바디 인스펙션 (샘플 로그 + 선택적 파일 스풀)
 - CLI 기반 설정 (TOML 파일 또는 CLI 플래그)
+- 인증서 포털 (Android/iOS/PEM CA 다운로드 페이지 제공)
 
 ## 설치/빌드
 
 ```bash
 cargo build --release
+cargo test
 ```
 
 ## CA 생성 (HTTPS MITM용)
@@ -34,7 +36,35 @@ cargo build --release
   --inspect-body --inspect-sample-bytes 16384
 ```
 
-CA를 제공하지 않으면 HTTPS는 **터널링만** 하고(MITM 아님) `map_local/status_rewrite`는 HTTPS에 적용되지 않습니다.
+`--ca-cert/--ca-key`를 생략해도 현재 디렉토리에 `ca.crt.pem`, `ca.key.pem`이 있으면 자동 로드됩니다.  
+CA를 로드하지 못하면(옵션 미지정 + 기본 파일 없음) HTTPS는 **터널링만** 하고(MITM 아님) `map_local/status_rewrite`는 HTTPS에 적용되지 않습니다.
+
+## 인증서 포털 (모바일 CA 설치)
+
+프록시 실행 중 아래 HTTP 호스트로 접속하면 인증서 다운로드 페이지를 제공합니다.
+
+- `http://crab-proxy.local/`
+- `http://crab-proxy.invalid/`
+- `http://proxy.crab/`
+
+다운로드 경로:
+
+- `/ca.pem` (PEM)
+- `/android.crt` (DER, Android)
+- `/ios.mobileconfig` (iOS 구성 프로파일)
+
+```bash
+# 포털 페이지 확인
+curl -x http://127.0.0.1:8080 http://crab-proxy.local/
+
+# CA PEM 다운로드
+curl -x http://127.0.0.1:8080 http://crab-proxy.local/ca.pem -o crab-proxy-ca.pem
+```
+
+주의:
+
+- 인증서 포털은 HTTP의 `GET/HEAD`만 지원합니다.
+- CA가 로드되지 않은 상태에서는 다운로드 엔드포인트가 `503 Service Unavailable`을 반환합니다.
 
 ## 사용 예 (curl)
 
