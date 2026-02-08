@@ -562,10 +562,11 @@ async fn proxy_http(
         );
     }
 
-    if allowed && let Some(rule) =
-        state
-            .rules
-            .find_map_local(&target.scheme, &target.authority, path_and_query)
+    if allowed
+        && let Some(rule) =
+            state
+                .rules
+                .find_map_local(&target.scheme, &target.authority, path_and_query)
     {
         let mut resp = map_local_response(rule).await?;
         apply_status_rewrite(
@@ -1161,6 +1162,7 @@ fn apply_content_headers(
 fn open_spool_file(cfg: &InspectConfig, direction: &str) -> std::io::Result<(PathBuf, File)> {
     let dir = cfg.spool_dir.clone().unwrap_or_else(std::env::temp_dir);
     fs::create_dir_all(&dir)?;
+    set_spool_dir_permissions(&dir)?;
 
     let now_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1168,9 +1170,38 @@ fn open_spool_file(cfg: &InspectConfig, direction: &str) -> std::io::Result<(Pat
         .as_millis();
     let id = NEXT_SPOOL_FILE_ID.fetch_add(1, Ordering::Relaxed);
     let path = dir.join(format!("crab-mitm-{direction}-{now_millis}-{id}.bin"));
-    let file = File::create(&path)?;
+    let file = create_private_spool_file(&path)?;
 
     Ok((path, file))
+}
+
+fn set_spool_dir_permissions(path: &PathBuf) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_private_spool_file(path: &PathBuf) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        return OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path);
+    }
+
+    #[cfg(not(unix))]
+    {
+        File::create(path)
+    }
 }
 
 fn escape_for_log(bytes: &[u8]) -> String {

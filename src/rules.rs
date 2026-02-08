@@ -71,9 +71,7 @@ impl AllowRule {
 
         if raw_lc.contains('/') {
             let no_scheme = format!("{authority}{path_and_query}");
-            return no_scheme
-                .to_ascii_lowercase()
-                .starts_with(&raw_lc);
+            return no_scheme.to_ascii_lowercase().starts_with(&raw_lc);
         }
 
         host_lc == raw_lc || host_lc.ends_with(&format!(".{raw_lc}"))

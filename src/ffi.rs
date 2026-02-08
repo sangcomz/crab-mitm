@@ -41,11 +41,15 @@ type CrabLogCallback =
 #[derive(Clone, Copy)]
 struct LogCallback {
     func: extern "C" fn(user_data: *mut c_void, level: u8, message: *const c_char),
-    user_data: *mut c_void,
+    // Raw pointer is stored as integer to avoid manually asserting Send/Sync for *mut c_void.
+    user_data: usize,
 }
 
-unsafe impl Send for LogCallback {}
-unsafe impl Sync for LogCallback {}
+impl LogCallback {
+    fn user_data_ptr(self) -> *mut c_void {
+        self.user_data as *mut c_void
+    }
+}
 
 static LOG_CALLBACK: OnceLock<RwLock<Option<LogCallback>>> = OnceLock::new();
 static LOG_INIT: Once = Once::new();
@@ -180,17 +184,16 @@ struct CallbackWriter;
 
 impl std::io::Write for CallbackWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let callback = match log_callback_store().read() {
-            Ok(guard) => *guard,
-            Err(_) => None,
-        };
-
-        if let Some(cb) = callback {
+        if let Ok(guard) = log_callback_store().read()
+            && let Some(cb) = *guard
+        {
             let msg = String::from_utf8_lossy(buf);
             let trimmed = msg.trim_end();
             if !trimmed.is_empty() {
                 if let Ok(c_msg) = CString::new(trimmed) {
-                    (cb.func)(cb.user_data, infer_level(trimmed), c_msg.as_ptr());
+                    // Keep the read lock held while invoking callback so callback teardown
+                    // (`crab_set_log_callback(nil, nil)`) waits for in-flight calls.
+                    (cb.func)(cb.user_data_ptr(), infer_level(trimmed), c_msg.as_ptr());
                 }
             }
         }
@@ -224,7 +227,10 @@ pub extern "C" fn crab_free_string(ptr: *mut c_char) {
 pub extern "C" fn crab_set_log_callback(callback: CrabLogCallback, user_data: *mut c_void) {
     init_tracing_once();
     if let Ok(mut guard) = log_callback_store().write() {
-        *guard = callback.map(|func| LogCallback { func, user_data });
+        *guard = callback.map(|func| LogCallback {
+            func,
+            user_data: user_data as usize,
+        });
     }
 }
 

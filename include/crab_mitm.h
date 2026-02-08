@@ -20,6 +20,7 @@ typedef struct {
     char *message;  /* NULL on success. Caller must free with crab_free_string. */
 } CrabResult;
 
+/* user_data must remain valid until crab_set_log_callback(NULL, NULL) returns. */
 typedef void (*CrabLogCallback)(void *user_data, uint8_t level, const char *message);
 
 void crab_free_string(char *ptr);

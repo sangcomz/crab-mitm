@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::BufReader;
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -35,10 +36,33 @@ pub fn generate_ca_to_files(
 
     std::fs::write(out_cert, cert.pem())
         .with_context(|| format!("failed to write {}", out_cert.display()))?;
-    std::fs::write(out_key, key_pair.serialize_pem())
+    write_private_key_pem(out_key, &key_pair.serialize_pem())
         .with_context(|| format!("failed to write {}", out_key.display()))?;
 
     Ok(())
+}
+
+fn write_private_key_pem(path: &Path, pem: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(pem.as_bytes())?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, pem)
+    }
 }
 
 pub struct CertificateAuthority {
