@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "crab-mitm"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -288,7 +288,7 @@ dependencies = [
  "hyper-util",
  "lru",
  "mime_guess",
- "pin-project-lite",
+ "pin-project",
  "rcgen",
  "rustls",
  "rustls-native-certs",
@@ -830,6 +830,26 @@ checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
  "base64",
  "serde_core",
+]
+
+[[package]]
+name = "pin-project"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "677f1add503faace112b9f1373e43e9e054bfdd22ff1a63c1bc485eaec6a6a8a"
+dependencies = [
+ "pin-project-internal",
+]
+
+[[package]]
+name = "pin-project-internal"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e918e4ff8c4549eb882f14b3a4bc8c8bc93de829416eacf579f1207a8fbf861"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

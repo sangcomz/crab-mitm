@@ -13,7 +13,8 @@ use base64::Engine as _;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use pin_project_lite::pin_project;
+use pin_project::pin_project;
+use pin_project::pinned_drop;
 use serde_json::json;
 
 use super::{InspectConfig, ProxyBody, boxed_body};
@@ -24,6 +25,7 @@ const PREVIEW_LOG_LIMIT_BYTES: usize = 512;
 
 #[derive(Clone)]
 pub(super) struct InspectMeta {
+    pub(super) request_id: Arc<str>,
     pub(super) direction: &'static str,
     pub(super) peer: SocketAddr,
     pub(super) method: Arc<str>,
@@ -50,12 +52,11 @@ pub(super) struct SpoolWriter {
     join: std::thread::JoinHandle<std::io::Result<()>>,
 }
 
-pin_project! {
-    pub(super) struct InspectableBody<B> {
-        #[pin]
-        inner: B,
-        inspector: Option<BodyInspector>,
-    }
+#[pin_project(PinnedDrop)]
+pub(super) struct InspectableBody<B> {
+    #[pin]
+    inner: B,
+    inspector: Option<BodyInspector>,
 }
 
 impl<B> InspectableBody<B> {
@@ -79,14 +80,20 @@ where
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.project();
+        let mut this = self.project();
 
-        match this.inner.poll_frame(cx) {
+        match this.inner.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref()
                     && let Some(inspector) = this.inspector.as_mut()
                 {
                     inspector.observe(data);
+                }
+
+                if this.inner.is_end_stream()
+                    && let Some(inspector) = this.inspector.take()
+                {
+                    inspector.finish("complete", None);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -113,6 +120,16 @@ where
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[pinned_drop]
+impl<B> PinnedDrop for InspectableBody<B> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        if let Some(inspector) = this.inspector.take() {
+            inspector.finish("dropped", None);
+        }
     }
 }
 
@@ -231,6 +248,7 @@ impl BodyInspector {
             .unwrap_or_else(|| "-".to_string());
 
         tracing::info!(
+            request_id = %self.meta.request_id,
             peer = %self.meta.peer,
             method = %self.meta.method,
             url = %self.meta.url,
@@ -255,6 +273,7 @@ impl BodyInspector {
             json!({
                 "type": "meta",
                 "event": "body_inspection",
+                "request_id": self.meta.request_id.as_ref(),
                 "peer": self.meta.peer.to_string(),
                 "method": self.meta.method.as_ref(),
                 "url": self.meta.url.as_ref(),

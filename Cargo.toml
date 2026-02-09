@@ -1,6 +1,6 @@
 [package]
 name = "crab-mitm"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2024"
 
 [features]
@@ -30,7 +30,7 @@ hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio"]
 hyper-util = { version = "0.1", features = ["client-legacy", "server", "server-auto", "http1", "http2", "tokio"] }
 lru = "0.12"
 mime_guess = "2.0"
-pin-project-lite = "0.2"
+pin-project = "1.1"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls = "0.23"
 rustls-native-certs = "0.8"

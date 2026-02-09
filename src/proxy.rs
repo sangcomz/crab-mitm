@@ -2,6 +2,7 @@ use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -47,6 +48,7 @@ use inspect::{BodyInspector, escape_for_log};
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, ProxyBody>;
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
 pub struct InspectConfig {
@@ -410,6 +412,7 @@ async fn proxy_http(
         target.scheme, target.authority, path_and_query
     ));
     let method_for_inspect: Arc<str> = Arc::from(method.as_str());
+    let request_id: Arc<str> = Arc::from(NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string());
 
     tracing::debug!(
         peer = %peer,
@@ -429,6 +432,7 @@ async fn proxy_http(
         emit_structured_log(json!({
             "type": "entry",
             "event": "cert_portal",
+            "request_id": request_id.as_ref(),
             "peer": peer.to_string(),
             "method": method.as_str(),
             "url": request_url.as_ref(),
@@ -453,6 +457,7 @@ async fn proxy_http(
         emit_structured_log(json!({
             "type": "meta",
             "event": "request_headers",
+            "request_id": request_id.as_ref(),
             "peer": peer.to_string(),
             "method": method.as_str(),
             "url": request_url.as_ref(),
@@ -485,6 +490,7 @@ async fn proxy_http(
         emit_structured_log(json!({
             "type": "entry",
             "event": "map_local",
+            "request_id": request_id.as_ref(),
             "peer": peer.to_string(),
             "method": method.as_str(),
             "url": request_url.as_ref(),
@@ -495,6 +501,7 @@ async fn proxy_http(
     }
 
     let inspect_req_meta = InspectMeta {
+        request_id: request_id.clone(),
         direction: "request",
         peer,
         method: method_for_inspect.clone(),
@@ -537,6 +544,7 @@ async fn proxy_http(
         emit_structured_log(json!({
             "type": "meta",
             "event": "response_headers",
+            "request_id": request_id.as_ref(),
             "peer": peer.to_string(),
             "method": method.as_str(),
             "url": request_url.as_ref(),
@@ -546,6 +554,7 @@ async fn proxy_http(
     }
 
     let inspect_resp_meta = InspectMeta {
+        request_id: request_id.clone(),
         direction: "response",
         peer,
         method: method_for_inspect,
@@ -582,6 +591,7 @@ async fn proxy_http(
         emit_structured_log(json!({
             "type": "entry",
             "event": "upstream",
+            "request_id": request_id.as_ref(),
             "peer": peer.to_string(),
             "method": method.as_str(),
             "url": request_url.as_ref(),
@@ -751,6 +761,7 @@ mod tests {
 
     fn test_meta() -> InspectMeta {
         InspectMeta {
+            request_id: Arc::from("test-request-1"),
             direction: "request",
             peer: "127.0.0.1:12345".parse().expect("socket addr"),
             method: Arc::from("POST"),

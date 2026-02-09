@@ -54,6 +54,11 @@ impl LogCallback {
 static LOG_CALLBACK: OnceLock<RwLock<Option<LogCallback>>> = OnceLock::new();
 static LOG_INIT: Once = Once::new();
 static MAP_LOCAL_ALLOWED_ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+const CALLBACK_BUFFER_LIMIT_BYTES: usize = 1024 * 1024;
+
+thread_local! {
+    static CALLBACK_LINE_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 fn ok_result() -> CrabResult {
     CrabResult {
@@ -367,6 +372,27 @@ fn trim_log_line_end(buf: &[u8]) -> &[u8] {
     &buf[..end]
 }
 
+fn emit_log_callback_line(cb: LogCallback, raw_line: &[u8]) {
+    let trimmed = trim_log_line_end(raw_line);
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if let Ok(c_msg) = CString::new(trimmed) {
+        (cb.func)(cb.user_data_ptr(), infer_level_bytes(trimmed), c_msg.as_ptr());
+        return;
+    }
+
+    let fallback = String::from_utf8_lossy(trimmed);
+    if let Ok(c_msg) = CString::new(fallback.as_bytes()) {
+        (cb.func)(
+            cb.user_data_ptr(),
+            infer_level(fallback.as_ref()),
+            c_msg.as_ptr(),
+        );
+    }
+}
+
 struct CallbackWriter;
 
 impl std::io::Write for CallbackWriter {
@@ -374,26 +400,24 @@ impl std::io::Write for CallbackWriter {
         if let Ok(guard) = log_callback_store().read()
             && let Some(cb) = *guard
         {
-            let trimmed = trim_log_line_end(buf);
-            if !trimmed.is_empty() {
-                if let Ok(c_msg) = CString::new(trimmed) {
-                    // Keep the read lock held while invoking callback so callback teardown
-                    // (`crab_set_log_callback(nil, nil)`) waits for in-flight calls.
-                    (cb.func)(
-                        cb.user_data_ptr(),
-                        infer_level_bytes(trimmed),
-                        c_msg.as_ptr(),
-                    );
-                } else {
-                    let fallback = String::from_utf8_lossy(trimmed);
-                    if let Ok(c_msg) = CString::new(fallback.as_bytes()) {
-                        (cb.func)(
-                            cb.user_data_ptr(),
-                            infer_level(fallback.as_ref()),
-                            c_msg.as_ptr(),
-                        );
-                    }
+            let mut completed_lines: Vec<Vec<u8>> = Vec::new();
+            CALLBACK_LINE_BUFFER.with(|line_buffer| {
+                let mut line_buffer = line_buffer.borrow_mut();
+                line_buffer.extend_from_slice(buf);
+
+                while let Some(pos) = line_buffer.iter().position(|byte| *byte == b'\n') {
+                    completed_lines.push(line_buffer.drain(..=pos).collect());
                 }
+
+                if line_buffer.len() > CALLBACK_BUFFER_LIMIT_BYTES {
+                    completed_lines.push(std::mem::take(&mut *line_buffer));
+                }
+            });
+
+            // Keep the read lock held while invoking callback so callback teardown
+            // (`crab_set_log_callback(nil, nil)`) waits for in-flight calls.
+            for line in completed_lines {
+                emit_log_callback_line(cb, &line);
             }
         }
 
@@ -401,6 +425,23 @@ impl std::io::Write for CallbackWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if let Ok(guard) = log_callback_store().read()
+            && let Some(cb) = *guard
+        {
+            let trailing = CALLBACK_LINE_BUFFER.with(|line_buffer| {
+                let mut line_buffer = line_buffer.borrow_mut();
+                if line_buffer.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(&mut *line_buffer))
+                }
+            });
+
+            if let Some(line) = trailing {
+                emit_log_callback_line(cb, &line);
+            }
+        }
+
         Ok(())
     }
 }
