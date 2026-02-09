@@ -275,6 +275,26 @@ fn validate_map_local_file_path(raw_path: &str) -> Result<PathBuf, CrabResult> {
     Ok(canonical)
 }
 
+fn runtime_worker_threads() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4);
+    parse_runtime_worker_threads(
+        std::env::var("CRAB_TOKIO_WORKER_THREADS").ok().as_deref(),
+        available,
+    )
+}
+
+fn parse_runtime_worker_threads(raw: Option<&str>, available: usize) -> usize {
+    const MAX_WORKER_THREADS: usize = 32;
+
+    let default_threads = available.clamp(1, MAX_WORKER_THREADS);
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.clamp(1, MAX_WORKER_THREADS))
+        .unwrap_or(default_threads)
+}
+
 fn stop_inner(handle: &CrabProxyHandle) -> Result<()> {
     if !handle.running.load(Ordering::SeqCst) {
         return Ok(());
@@ -335,6 +355,18 @@ fn infer_level(line: &str) -> u8 {
     }
 }
 
+fn infer_level_bytes(line: &[u8]) -> u8 {
+    std::str::from_utf8(line).map_or(2, infer_level)
+}
+
+fn trim_log_line_end(buf: &[u8]) -> &[u8] {
+    let mut end = buf.len();
+    while end > 0 && (buf[end - 1] == b'\n' || buf[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &buf[..end]
+}
+
 struct CallbackWriter;
 
 impl std::io::Write for CallbackWriter {
@@ -342,13 +374,25 @@ impl std::io::Write for CallbackWriter {
         if let Ok(guard) = log_callback_store().read()
             && let Some(cb) = *guard
         {
-            let msg = String::from_utf8_lossy(buf);
-            let trimmed = msg.trim_end();
+            let trimmed = trim_log_line_end(buf);
             if !trimmed.is_empty() {
                 if let Ok(c_msg) = CString::new(trimmed) {
                     // Keep the read lock held while invoking callback so callback teardown
                     // (`crab_set_log_callback(nil, nil)`) waits for in-flight calls.
-                    (cb.func)(cb.user_data_ptr(), infer_level(trimmed), c_msg.as_ptr());
+                    (cb.func)(
+                        cb.user_data_ptr(),
+                        infer_level_bytes(trimmed),
+                        c_msg.as_ptr(),
+                    );
+                } else {
+                    let fallback = String::from_utf8_lossy(trimmed);
+                    if let Ok(c_msg) = CString::new(fallback.as_bytes()) {
+                        (cb.func)(
+                            cb.user_data_ptr(),
+                            infer_level(fallback.as_ref()),
+                            c_msg.as_ptr(),
+                        );
+                    }
                 }
             }
         }
@@ -403,7 +447,7 @@ pub extern "C" fn crab_proxy_create(
             unsafe { cstr_to_string(listen_addr) }.unwrap_or_else(|| "127.0.0.1:8080".to_string());
 
         let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(runtime_worker_threads())
             .enable_all()
             .build()
         {
@@ -745,4 +789,221 @@ pub extern "C" fn crab_ca_generate(
             Err(err) => err_result(CRAB_ERR_CA, &format!("{err:#}")),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::ffi::CString;
+    use std::fs;
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    struct OwnedHandle(*mut CrabProxyHandle);
+
+    impl OwnedHandle {
+        fn raw(&self) -> *mut CrabProxyHandle {
+            self.0
+        }
+    }
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            crab_proxy_destroy(self.0);
+        }
+    }
+
+    fn crab_result_to_owned(result: CrabResult) -> (i32, String) {
+        let message = if result.message.is_null() {
+            String::new()
+        } else {
+            let message = unsafe { CStr::from_ptr(result.message) }
+                .to_string_lossy()
+                .into_owned();
+            crab_free_string(result.message);
+            message
+        };
+        (result.code, message)
+    }
+
+    fn assert_ok(result: CrabResult) {
+        let (code, message) = crab_result_to_owned(result);
+        assert_eq!(code, CRAB_OK, "unexpected error: {message}");
+    }
+
+    fn create_handle(listen_addr: Option<&str>) -> OwnedHandle {
+        let mut raw: *mut CrabProxyHandle = std::ptr::null_mut();
+        let listen_cstr = listen_addr.map(|s| CString::new(s).expect("listen cstring"));
+        let listen_ptr = listen_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr());
+        assert_ok(crab_proxy_create(&mut raw, listen_ptr));
+        assert!(!raw.is_null(), "create returned null handle");
+        OwnedHandle(raw)
+    }
+
+    fn choose_free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral port")
+            .local_addr()
+            .expect("local addr")
+            .port()
+    }
+
+    fn unique_temp_path(prefix: &str, suffix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("crab-mitm-{prefix}-{nanos}-{suffix}"))
+    }
+
+    fn parse_c_header_error_codes() -> HashMap<String, i32> {
+        let header_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include/crab_mitm.h");
+        let content = fs::read_to_string(&header_path).expect("read crab_mitm.h");
+        let mut in_enum = false;
+        let mut codes = HashMap::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with("enum {") {
+                in_enum = true;
+                continue;
+            }
+            if in_enum && line.starts_with("};") {
+                break;
+            }
+            if !in_enum || line.is_empty() || line.starts_with("/*") {
+                continue;
+            }
+
+            let line = line.trim_end_matches(',');
+            if let Some((name, raw_value)) = line.split_once('=') {
+                let name = name.trim().to_string();
+                let value = raw_value
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap_or_else(|_| panic!("invalid enum value in header: {line}"));
+                codes.insert(name, value);
+            }
+        }
+
+        assert!(
+            !codes.is_empty(),
+            "failed to parse any error codes from header"
+        );
+        codes
+    }
+
+    #[test]
+    fn ffi_create_rejects_null_out_handle() {
+        let (code, message) =
+            crab_result_to_owned(crab_proxy_create(std::ptr::null_mut(), std::ptr::null()));
+        assert_eq!(code, CRAB_ERR_INVALID_ARG);
+        assert!(message.contains("out_handle"));
+    }
+
+    #[test]
+    fn ffi_create_and_destroy_roundtrip() {
+        let handle = create_handle(None);
+        assert!(!crab_proxy_is_running(handle.raw()));
+    }
+
+    #[test]
+    fn ffi_set_port_rejects_zero() {
+        let handle = create_handle(None);
+        let (code, message) = crab_result_to_owned(crab_proxy_set_port(handle.raw(), 0));
+        assert_eq!(code, CRAB_ERR_INVALID_ARG);
+        assert!(message.contains("port"));
+    }
+
+    #[test]
+    fn ffi_map_local_file_rejects_parent_traversal() {
+        let handle = create_handle(None);
+        let matcher = CString::new("example.com/*").expect("matcher cstring");
+        let file_path = CString::new("../etc/passwd").expect("file path cstring");
+        let (code, message) = crab_result_to_owned(crab_proxy_rules_add_map_local_file(
+            handle.raw(),
+            matcher.as_ptr(),
+            file_path.as_ptr(),
+            200,
+            std::ptr::null(),
+        ));
+        assert_eq!(code, CRAB_ERR_INVALID_ARG);
+        assert!(message.contains("parent-directory"));
+    }
+
+    #[test]
+    fn ffi_map_local_file_accepts_existing_file_in_allowed_roots() {
+        let handle = create_handle(None);
+        let path = unique_temp_path("ffi-map-local", "ok.txt");
+        fs::write(&path, b"ok").expect("write temp file");
+
+        let matcher = CString::new("example.com/*").expect("matcher cstring");
+        let file_path = CString::new(path.display().to_string()).expect("file path cstring");
+        let (code, message) = crab_result_to_owned(crab_proxy_rules_add_map_local_file(
+            handle.raw(),
+            matcher.as_ptr(),
+            file_path.as_ptr(),
+            200,
+            std::ptr::null(),
+        ));
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            code, CRAB_OK,
+            "expected map_local file rule success: {message}"
+        );
+    }
+
+    #[test]
+    fn ffi_rejects_rule_changes_while_running() {
+        let listen = format!("127.0.0.1:{}", choose_free_port());
+        let handle = create_handle(Some(&listen));
+        assert_ok(crab_proxy_start(handle.raw()));
+
+        let matcher = CString::new("example.com/*").expect("matcher cstring");
+        let (code, message) =
+            crab_result_to_owned(crab_proxy_rules_add_allow(handle.raw(), matcher.as_ptr()));
+        assert_eq!(code, CRAB_ERR_STATE);
+        assert!(message.contains("running"));
+
+        assert_ok(crab_proxy_stop(handle.raw()));
+    }
+
+    #[test]
+    fn ffi_error_codes_match_c_header() {
+        let codes = parse_c_header_error_codes();
+        assert_eq!(codes.get("CRAB_OK"), Some(&CRAB_OK));
+        assert_eq!(
+            codes.get("CRAB_ERR_INVALID_ARG"),
+            Some(&CRAB_ERR_INVALID_ARG)
+        );
+        assert_eq!(codes.get("CRAB_ERR_STATE"), Some(&CRAB_ERR_STATE));
+        assert_eq!(codes.get("CRAB_ERR_IO"), Some(&CRAB_ERR_IO));
+        assert_eq!(codes.get("CRAB_ERR_CA"), Some(&CRAB_ERR_CA));
+        assert_eq!(codes.get("CRAB_ERR_INTERNAL"), Some(&CRAB_ERR_INTERNAL));
+    }
+
+    #[test]
+    fn runtime_worker_threads_defaults_to_available_parallelism() {
+        assert_eq!(parse_runtime_worker_threads(None, 12), 12);
+        assert_eq!(parse_runtime_worker_threads(None, 0), 1);
+    }
+
+    #[test]
+    fn runtime_worker_threads_honors_valid_env_override() {
+        assert_eq!(parse_runtime_worker_threads(Some("6"), 12), 6);
+        assert_eq!(parse_runtime_worker_threads(Some(" 2 "), 12), 2);
+    }
+
+    #[test]
+    fn runtime_worker_threads_rejects_invalid_values() {
+        assert_eq!(parse_runtime_worker_threads(Some("0"), 8), 8);
+        assert_eq!(parse_runtime_worker_threads(Some("-1"), 8), 8);
+        assert_eq!(parse_runtime_worker_threads(Some("abc"), 8), 8);
+    }
 }

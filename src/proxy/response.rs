@@ -17,33 +17,11 @@ pub(super) fn maybe_head_response(
 }
 
 pub(super) fn text_response(status: StatusCode, body: String) -> hyper::Response<ProxyBody> {
-    let bytes = Bytes::from(body);
-    let mut resp = hyper::Response::new(boxed_body(Full::new(bytes.clone())));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    resp.headers_mut().insert(
-        http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&bytes.len().to_string()).expect("content-length"),
-    );
-    resp
+    owned_bytes_response(status, "text/plain; charset=utf-8", Bytes::from(body))
 }
 
 pub(super) fn html_response(status: StatusCode, html: String) -> hyper::Response<ProxyBody> {
-    let bytes = Bytes::from(html);
-    let mut resp = hyper::Response::new(boxed_body(Full::new(bytes.clone())));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    resp.headers_mut().insert(
-        http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&bytes.len().to_string()).expect("content-length"),
-    );
-    resp
+    owned_bytes_response(status, "text/html; charset=utf-8", Bytes::from(html))
 }
 
 pub(super) fn bytes_response(
@@ -51,7 +29,16 @@ pub(super) fn bytes_response(
     content_type: &'static str,
     body: Bytes,
 ) -> hyper::Response<ProxyBody> {
-    let mut resp = hyper::Response::new(boxed_body(Full::new(body.clone())));
+    owned_bytes_response(status, content_type, body)
+}
+
+fn owned_bytes_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Bytes,
+) -> hyper::Response<ProxyBody> {
+    let content_length = body.len();
+    let mut resp = hyper::Response::new(boxed_body(Full::new(body)));
     *resp.status_mut() = status;
     resp.headers_mut().insert(
         http::header::CONTENT_TYPE,
@@ -59,7 +46,7 @@ pub(super) fn bytes_response(
     );
     resp.headers_mut().insert(
         http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body.len().to_string()).expect("content-length"),
+        HeaderValue::from_str(&content_length.to_string()).expect("content-length"),
     );
     resp
 }

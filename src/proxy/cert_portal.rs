@@ -1,7 +1,10 @@
+use std::fmt::Write as _;
+
 use base64::Engine as _;
 use bytes::Bytes;
 use http::header::HeaderValue;
 use http::{Method, StatusCode};
+use sha2::{Digest, Sha256};
 
 use crate::ca::CertificateAuthority;
 
@@ -38,13 +41,17 @@ pub(super) fn maybe_handle_cert_portal(
     let base_url = format!("http://{}", target.authority);
 
     match path {
-        "/" | "/index.html" => Some(maybe_head_response(
-            method,
-            html_response(
-                StatusCode::OK,
-                build_cert_portal_page(&base_url, ca.is_some()),
-            ),
-        )),
+        "/" | "/index.html" => {
+            let fingerprint_sha256 =
+                ca.map(|authority| ca_cert_fingerprint_sha256(authority.ca_cert_der()));
+            Some(maybe_head_response(
+                method,
+                html_response(
+                    StatusCode::OK,
+                    build_cert_portal_page(&base_url, fingerprint_sha256.as_deref()),
+                ),
+            ))
+        }
         "/ca.pem" => {
             let Some(ca) = ca else {
                 return Some(maybe_head_response(
@@ -125,8 +132,8 @@ pub(super) fn is_cert_portal_host(host: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(host))
 }
 
-pub(super) fn build_cert_portal_page(base_url: &str, has_ca: bool) -> String {
-    let ca_section = if has_ca {
+pub(super) fn build_cert_portal_page(base_url: &str, fingerprint_sha256: Option<&str>) -> String {
+    let ca_section = if let Some(fingerprint_sha256) = fingerprint_sha256 {
         format!(
             r#"
 <div class="card">
@@ -134,11 +141,13 @@ pub(super) fn build_cert_portal_page(base_url: &str, has_ca: bool) -> String {
   <p><b>Android:</b> download and install <a href="{base}/android.crt">android.crt</a></p>
   <p><b>iOS:</b> download and install <a href="{base}/ios.mobileconfig">ios.mobileconfig</a></p>
   <p><b>Raw PEM:</b> <a href="{base}/ca.pem">ca.pem</a></p>
+  <p class="fingerprint"><b>SHA-256 Fingerprint:</b><br /><code>{fingerprint}</code></p>
   <p class="note">iOS requires extra trust step:
   Settings &gt; General &gt; About &gt; Certificate Trust Settings.</p>
 </div>
 "#,
-            base = base_url
+            base = base_url,
+            fingerprint = fingerprint_sha256
         )
     } else {
         r#"
@@ -206,6 +215,15 @@ pub(super) fn build_cert_portal_page(base_url: &str, has_ca: bool) -> String {
       font-size: 14px;
       margin-top: 12px;
     }}
+    .fingerprint {{
+      margin-top: 12px;
+      font-size: 14px;
+      line-height: 1.7;
+    }}
+    .fingerprint code {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      word-break: break-all;
+    }}
   </style>
 </head>
 <body>
@@ -221,6 +239,8 @@ pub(super) fn build_cert_portal_page(base_url: &str, has_ca: bool) -> String {
 
 pub(super) fn build_ios_mobileconfig(ca_der: &[u8]) -> String {
     let cert_b64 = base64::engine::general_purpose::STANDARD.encode(ca_der);
+    let cert_payload_uuid = mobileconfig_payload_uuid(ca_der, "cert-payload");
+    let profile_payload_uuid = mobileconfig_payload_uuid(ca_der, "profile-payload");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -242,7 +262,7 @@ pub(super) fn build_ios_mobileconfig(ca_der: &[u8]) -> String {
       <key>PayloadType</key>
       <string>com.apple.security.root</string>
       <key>PayloadUUID</key>
-      <string>8891AB7E-3E52-47F4-8A0A-9A4A6D4FAF11</string>
+      <string>{cert_payload_uuid}</string>
       <key>PayloadVersion</key>
       <integer>1</integer>
     </dict>
@@ -260,10 +280,59 @@ pub(super) fn build_ios_mobileconfig(ca_der: &[u8]) -> String {
   <key>PayloadType</key>
   <string>Configuration</string>
   <key>PayloadUUID</key>
-  <string>778E1AF7-EB28-4B8D-92A0-0295A53D5C72</string>
+  <string>{profile_payload_uuid}</string>
   <key>PayloadVersion</key>
   <integer>1</integer>
 </dict>
 </plist>"#
+    )
+}
+
+pub(super) fn ca_cert_fingerprint_sha256(ca_der: &[u8]) -> String {
+    let digest = Sha256::digest(ca_der);
+    let mut out = String::with_capacity((digest.len() * 3) - 1);
+    for (index, byte) in digest.iter().enumerate() {
+        if index > 0 {
+            out.push(':');
+        }
+        write!(&mut out, "{:02X}", byte).expect("fingerprint formatting");
+    }
+    out
+}
+
+fn mobileconfig_payload_uuid(ca_der: &[u8], purpose: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(ca_der);
+    hasher.update([0u8]);
+    hasher.update(purpose.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // Deterministic RFC 4122 UUID (v5-like layout) derived from cert fingerprint.
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format_uuid(bytes)
+}
+
+fn format_uuid(bytes: [u8; 16]) -> String {
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
     )
 }

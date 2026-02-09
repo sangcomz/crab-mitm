@@ -14,6 +14,7 @@ use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use pin_project_lite::pin_project;
+use serde_json::json;
 
 use super::{InspectConfig, ProxyBody, boxed_body};
 
@@ -36,12 +37,17 @@ pub(super) struct BodyInspector {
     pub(super) sample_limit: usize,
     pub(super) sample_truncated: bool,
     pub(super) total_bytes: u64,
-    pub(super) spool_file: Option<File>,
+    pub(super) spool_writer: Option<SpoolWriter>,
     pub(super) spool_path: Option<PathBuf>,
     pub(super) spool_max_bytes: u64,
     pub(super) spool_written: u64,
     pub(super) spool_truncated: bool,
     pub(super) spool_error: Option<String>,
+}
+
+pub(super) struct SpoolWriter {
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    join: std::thread::JoinHandle<std::io::Result<()>>,
 }
 
 pin_project! {
@@ -114,11 +120,11 @@ impl BodyInspector {
     pub(super) fn new(cfg: &InspectConfig, meta: InspectMeta) -> Self {
         let mut inspector = Self {
             meta,
-            sample: Vec::new(),
+            sample: Vec::with_capacity(cfg.sample_bytes.min(64 * 1024)),
             sample_limit: cfg.sample_bytes,
             sample_truncated: false,
             total_bytes: 0,
-            spool_file: None,
+            spool_writer: None,
             spool_path: None,
             spool_max_bytes: cfg.spool_max_bytes,
             spool_written: 0,
@@ -130,7 +136,14 @@ impl BodyInspector {
             match open_spool_file(cfg, inspector.meta.direction) {
                 Ok((path, file)) => {
                     inspector.spool_path = Some(path);
-                    inspector.spool_file = Some(file);
+                    match spawn_spool_writer(file) {
+                        Ok(writer) => {
+                            inspector.spool_writer = Some(writer);
+                        }
+                        Err(err) => {
+                            inspector.spool_error = Some(err.to_string());
+                        }
+                    }
                 }
                 Err(err) => {
                     inspector.spool_error = Some(err.to_string());
@@ -163,7 +176,7 @@ impl BodyInspector {
             self.sample_truncated = true;
         }
 
-        if self.spool_file.is_some() {
+        if let Some(writer) = self.spool_writer.as_ref() {
             if self.spool_written >= self.spool_max_bytes {
                 self.spool_truncated = true;
                 return;
@@ -173,14 +186,9 @@ impl BodyInspector {
             let write_len = remaining.min(bytes.len());
 
             if write_len > 0 {
-                let write_result = self
-                    .spool_file
-                    .as_mut()
-                    .expect("spool_file checked")
-                    .write_all(&bytes[..write_len]);
-                if let Err(err) = write_result {
-                    self.spool_error = Some(err.to_string());
-                    self.spool_file = None;
+                if writer.tx.send(bytes[..write_len].to_vec()).is_err() {
+                    self.spool_error = Some("spool writer channel closed".to_string());
+                    self.spool_writer = None;
                     return;
                 }
                 self.spool_written += write_len as u64;
@@ -193,11 +201,22 @@ impl BodyInspector {
     }
 
     pub(super) fn finish(mut self, outcome: &'static str, error: Option<String>) {
-        if let Some(file) = self.spool_file.as_mut()
-            && let Err(err) = file.flush()
-            && self.spool_error.is_none()
-        {
-            self.spool_error = Some(err.to_string());
+        if let Some(writer) = self.spool_writer.take() {
+            let SpoolWriter { tx, join } = writer;
+            drop(tx);
+            match join.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if self.spool_error.is_none() {
+                        self.spool_error = Some(err.to_string());
+                    }
+                }
+                Err(_) => {
+                    if self.spool_error.is_none() {
+                        self.spool_error = Some("spool writer thread panicked".to_string());
+                    }
+                }
+            }
         }
 
         let preview_source_len = self.sample.len().min(PREVIEW_LOG_LIMIT_BYTES);
@@ -231,6 +250,22 @@ impl BodyInspector {
             error = %error.as_deref().unwrap_or("-"),
             "body inspection"
         );
+        tracing::info!(
+            "CRAB_JSON {}",
+            json!({
+                "type": "meta",
+                "event": "body_inspection",
+                "peer": self.meta.peer.to_string(),
+                "method": self.meta.method.as_ref(),
+                "url": self.meta.url.as_ref(),
+                "direction": self.meta.direction,
+                "response_status": self.meta.response_status.map(|status| status.as_u16()),
+                "body_bytes": self.total_bytes,
+                "sample_b64": sample_b64,
+                "outcome": outcome,
+                "error": error
+            })
+        );
     }
 }
 
@@ -257,14 +292,65 @@ pub(super) fn escape_for_log(bytes: &[u8]) -> String {
 }
 
 pub(super) fn encode_headers_for_log(headers: &HeaderMap) -> String {
-    let mut plain = String::new();
+    let mask_sensitive = should_mask_sensitive_headers();
+    let estimated_capacity = headers.iter().fold(0usize, |acc, (name, value)| {
+        let value_len = value.to_str().map_or(12, |v| v.len());
+        acc + name.as_str().len() + value_len + 3
+    });
+    let mut plain = String::with_capacity(estimated_capacity);
     for (name, value) in headers {
         plain.push_str(name.as_str());
         plain.push_str(": ");
-        plain.push_str(value.to_str().unwrap_or("<non-utf8>"));
+        if mask_sensitive && is_sensitive_header(name.as_str()) {
+            plain.push_str("<redacted>");
+        } else {
+            plain.push_str(value.to_str().unwrap_or("<non-utf8>"));
+        }
         plain.push('\n');
     }
     base64::engine::general_purpose::STANDARD.encode(plain.as_bytes())
+}
+
+fn spawn_spool_writer(mut file: File) -> std::io::Result<SpoolWriter> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let join = std::thread::Builder::new()
+        .name("crab-mitm-spool-writer".to_string())
+        .spawn(move || -> std::io::Result<()> {
+            while let Ok(chunk) = rx.recv() {
+                file.write_all(&chunk)?;
+            }
+            file.flush()?;
+            Ok(())
+        })?;
+    Ok(SpoolWriter { tx, join })
+}
+
+fn should_mask_sensitive_headers() -> bool {
+    parse_env_bool_default_true(std::env::var("CRAB_MASK_SENSITIVE_HEADERS").ok().as_deref())
+}
+
+fn parse_env_bool_default_true(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None => true,
+        Some(value)
+            if value.eq_ignore_ascii_case("0")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no") =>
+        {
+            false
+        }
+        Some(_) => true,
+    }
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("set-cookie")
+        || name.eq_ignore_ascii_case("x-api-key")
+        || name.eq_ignore_ascii_case("x-auth-token")
 }
 
 fn open_spool_file(cfg: &InspectConfig, direction: &str) -> std::io::Result<(PathBuf, File)> {

@@ -33,11 +33,16 @@ pub struct Rules {
 #[derive(Clone, Debug)]
 pub struct AllowRule {
     raw: String,
+    matcher: Matcher,
 }
 
 impl AllowRule {
     pub fn new(raw: impl Into<String>) -> Self {
-        Self { raw: raw.into() }
+        let raw = raw.into();
+        Self {
+            matcher: Matcher::new(raw.clone()),
+            raw,
+        }
     }
 
     pub fn raw(&self) -> &str {
@@ -53,12 +58,8 @@ impl AllowRule {
             return true;
         }
 
-        let full = format!("{scheme}://{authority}{path_and_query}");
-        if raw.starts_with("http://") || raw.starts_with("https://") {
-            return full.starts_with(raw);
-        }
-        if raw.starts_with('/') {
-            return path_and_query.starts_with(raw);
+        if is_full_url_pattern(raw) || raw.starts_with('/') {
+            return self.matcher.is_match(scheme, authority, path_and_query);
         }
 
         let host = extract_host(authority);
@@ -66,15 +67,23 @@ impl AllowRule {
         let raw_lc = raw.to_ascii_lowercase();
 
         if let Some(suffix) = raw_lc.strip_prefix("*.") {
-            return host_lc.ends_with(&format!(".{suffix}"));
+            return host_lc.len() > suffix.len()
+                && host_lc.ends_with(suffix)
+                && host_lc.as_bytes()[host_lc.len() - suffix.len() - 1] == b'.';
         }
 
         if raw_lc.contains('/') {
-            let no_scheme = format!("{authority}{path_and_query}");
-            return no_scheme.to_ascii_lowercase().starts_with(&raw_lc);
+            return starts_with_authority_and_path_ignore_ascii_case(
+                authority,
+                path_and_query,
+                raw,
+            );
         }
 
-        host_lc == raw_lc || host_lc.ends_with(&format!(".{raw_lc}"))
+        host_lc == raw_lc
+            || (host_lc.len() > raw_lc.len()
+                && host_lc.ends_with(&raw_lc)
+                && host_lc.as_bytes()[host_lc.len() - raw_lc.len() - 1] == b'.')
     }
 }
 
@@ -102,18 +111,71 @@ impl Matcher {
     }
 
     pub fn is_match(&self, scheme: &str, authority: &str, path_and_query: &str) -> bool {
-        let full = format!("{scheme}://{authority}{path_and_query}");
-        if self.raw.starts_with("http://") || self.raw.starts_with("https://") {
-            return full.starts_with(&self.raw);
+        let raw = self.raw.trim();
+        if raw.is_empty() {
+            return false;
+        }
+        if is_full_url_pattern(raw) {
+            return starts_with_full_url(scheme, authority, path_and_query, raw);
         }
 
-        if self.raw.starts_with('/') {
-            return path_and_query.starts_with(&self.raw);
+        if raw.starts_with('/') {
+            return path_and_query.starts_with(raw);
         }
 
-        let no_scheme = format!("{authority}{path_and_query}");
-        no_scheme.starts_with(&self.raw)
+        starts_with_authority_and_path(authority, path_and_query, raw)
     }
+}
+
+fn is_full_url_pattern(raw: &str) -> bool {
+    raw.starts_with("http://") || raw.starts_with("https://")
+}
+
+fn starts_with_full_url(scheme: &str, authority: &str, path_and_query: &str, raw: &str) -> bool {
+    let Some((raw_scheme, remainder)) = raw.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case(raw_scheme) {
+        return false;
+    }
+    starts_with_authority_and_path(authority, path_and_query, remainder)
+}
+
+fn starts_with_authority_and_path(authority: &str, path_and_query: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    if prefix.len() <= authority.len() {
+        return authority.as_bytes().starts_with(prefix.as_bytes());
+    }
+    if !prefix.as_bytes().starts_with(authority.as_bytes()) {
+        return false;
+    }
+    path_and_query.starts_with(&prefix[authority.len()..])
+}
+
+fn starts_with_authority_and_path_ignore_ascii_case(
+    authority: &str,
+    path_and_query: &str,
+    prefix: &str,
+) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    if prefix.len() <= authority.len() {
+        return authority
+            .get(..prefix.len())
+            .is_some_and(|left| left.eq_ignore_ascii_case(prefix));
+    }
+    if !prefix
+        .get(..authority.len())
+        .is_some_and(|left| left.eq_ignore_ascii_case(authority))
+    {
+        return false;
+    }
+    path_and_query
+        .get(..prefix.len() - authority.len())
+        .is_some_and(|left| left.eq_ignore_ascii_case(&prefix[authority.len()..]))
 }
 
 impl Rules {

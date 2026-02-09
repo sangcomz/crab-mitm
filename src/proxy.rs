@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::error::Error as StdError;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,12 +13,13 @@ use http_body::{Body as HttpBody, Frame};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::upgrade;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use serde_json::json;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -37,7 +38,9 @@ use inspect::{InspectMeta, encode_headers_for_log, maybe_inspect_body};
 use response::{apply_content_headers, text_response};
 
 #[cfg(test)]
-use cert_portal::{build_cert_portal_page, build_ios_mobileconfig, is_cert_portal_host};
+use cert_portal::{
+    build_cert_portal_page, build_ios_mobileconfig, ca_cert_fingerprint_sha256, is_cert_portal_host,
+};
 #[cfg(test)]
 use inspect::{BodyInspector, escape_for_log};
 
@@ -135,6 +138,7 @@ fn build_client() -> Result<HttpClient> {
         .context("failed to load native root certs")?
         .https_or_http()
         .enable_http1()
+        .enable_http2()
         .build();
 
     Ok(Client::builder(TokioExecutor::new()).build(https))
@@ -153,13 +157,15 @@ async fn serve_client(stream: TcpStream, peer: SocketAddr, state: ProxyState) ->
         async move { Ok::<_, Infallible>(handle_request(req, peer, state, ctx).await) }
     });
 
-    http1::Builder::new()
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
         .preserve_header_case(true)
-        .title_case_headers(true)
-        .serve_connection(io, svc)
-        .with_upgrades()
+        .title_case_headers(true);
+    builder
+        .serve_connection_with_upgrades(io, svc)
         .await
-        .context("serve_connection failed")?;
+        .map_err(|err| anyhow::anyhow!("serve_connection failed: {err}"))?;
 
     Ok(())
 }
@@ -197,6 +203,19 @@ fn handle_connect(
     let host = authority.host().to_string();
     let port = authority.port_u16().unwrap_or(443);
     let authority_str = authority.to_string();
+    let on_upgrade = upgrade::on(req);
+
+    if is_connect_target_blocked(&host, port) {
+        tracing::warn!(
+            peer = %peer,
+            target = %authority_str,
+            "CONNECT target blocked by policy"
+        );
+        return text_response(
+            StatusCode::FORBIDDEN,
+            "CONNECT target blocked by policy\n".to_string(),
+        );
+    }
 
     tracing::info!(peer = %peer, target = %authority_str, "CONNECT");
 
@@ -204,8 +223,6 @@ fn handle_connect(
     let rules = state.rules.clone();
     let client = state.client.clone();
     let inspect = state.inspect.clone();
-
-    let on_upgrade = upgrade::on(req);
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -251,6 +268,77 @@ async fn tunnel_tcp(client_io: upgrade::Upgraded, host: &str, port: u16) -> Resu
     Ok(())
 }
 
+fn is_connect_target_blocked(host: &str, port: u16) -> bool {
+    if !connect_private_block_enabled() {
+        return false;
+    }
+
+    if is_blocked_connect_host_literal(host) {
+        return true;
+    }
+
+    match (host, port).to_socket_addrs() {
+        Ok(addrs) => addrs
+            .into_iter()
+            .any(|addr| is_blocked_connect_ip(addr.ip())),
+        Err(err) => {
+            tracing::debug!(target = %host, error = %err, "CONNECT target DNS lookup failed");
+            false
+        }
+    }
+}
+
+fn connect_private_block_enabled() -> bool {
+    parse_env_bool_default_true(std::env::var("CRAB_CONNECT_BLOCK_PRIVATE").ok().as_deref())
+}
+
+fn parse_env_bool_default_true(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None => true,
+        Some(value)
+            if value.eq_ignore_ascii_case("0")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no") =>
+        {
+            false
+        }
+        Some(_) => true,
+    }
+}
+
+fn is_blocked_connect_host_literal(host: &str) -> bool {
+    let normalized = host.trim().trim_end_matches('.');
+    let lowercase = normalized.to_ascii_lowercase();
+    if lowercase == "localhost" || lowercase.ends_with(".localhost") {
+        return true;
+    }
+
+    normalized
+        .parse::<IpAddr>()
+        .is_ok_and(is_blocked_connect_ip)
+}
+
+fn is_blocked_connect_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_private()
+                || ipv4.is_loopback()
+                || ipv4.is_link_local()
+                || ipv4.is_unspecified()
+                || ipv4.is_multicast()
+                || ipv4.is_broadcast()
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()
+                || ipv6.is_unspecified()
+                || ipv6.is_multicast()
+                || ipv6.is_unique_local()
+                || ipv6.is_unicast_link_local()
+        }
+    }
+}
+
 async fn mitm_https(
     upgraded: upgrade::Upgraded,
     peer: SocketAddr,
@@ -289,13 +377,15 @@ async fn mitm_https(
         async move { Ok::<_, Infallible>(handle_request(req, peer, state, ctx).await) }
     });
 
-    http1::Builder::new()
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
         .preserve_header_case(true)
-        .title_case_headers(true)
-        .serve_connection(io, svc)
-        .with_upgrades()
+        .title_case_headers(true);
+    builder
+        .serve_connection_with_upgrades(io, svc)
         .await
-        .context("serve_connection (mitm) failed")?;
+        .map_err(|err| anyhow::anyhow!("serve_connection (mitm) failed: {err}"))?;
 
     Ok(())
 }
@@ -336,6 +426,14 @@ async fn proxy_http(
             status = %resp.status(),
             "cert_portal"
         );
+        emit_structured_log(json!({
+            "type": "entry",
+            "event": "cert_portal",
+            "peer": peer.to_string(),
+            "method": method.as_str(),
+            "url": request_url.as_ref(),
+            "status": resp.status().as_u16()
+        }));
         return Ok(resp);
     }
 
@@ -344,13 +442,22 @@ async fn proxy_http(
         .is_allowed(&target.scheme, &target.authority, path_and_query);
 
     if allowed {
+        let headers_b64 = encode_headers_for_log(&parts.headers);
         tracing::info!(
             peer = %peer,
             method = %method,
             url = %request_url,
-            headers_b64 = %encode_headers_for_log(&parts.headers),
+            headers_b64 = %headers_b64,
             "request_headers"
         );
+        emit_structured_log(json!({
+            "type": "meta",
+            "event": "request_headers",
+            "peer": peer.to_string(),
+            "method": method.as_str(),
+            "url": request_url.as_ref(),
+            "headers_b64": headers_b64
+        }));
     }
 
     if allowed
@@ -375,6 +482,15 @@ async fn proxy_http(
             map_local = %rule.matcher.raw(),
             "map_local"
         );
+        emit_structured_log(json!({
+            "type": "entry",
+            "event": "map_local",
+            "peer": peer.to_string(),
+            "method": method.as_str(),
+            "url": request_url.as_ref(),
+            "status": resp.status().as_u16(),
+            "map_local": rule.matcher.raw()
+        }));
         return Ok(resp);
     }
 
@@ -409,14 +525,24 @@ async fn proxy_http(
     strip_hop_headers(&mut resp_parts.headers);
     let upstream_status = resp_parts.status;
     if allowed {
+        let headers_b64 = encode_headers_for_log(&resp_parts.headers);
         tracing::info!(
             peer = %peer,
             method = %method,
             url = %request_url,
             status = %upstream_status,
-            headers_b64 = %encode_headers_for_log(&resp_parts.headers),
+            headers_b64 = %headers_b64,
             "response_headers"
         );
+        emit_structured_log(json!({
+            "type": "meta",
+            "event": "response_headers",
+            "peer": peer.to_string(),
+            "method": method.as_str(),
+            "url": request_url.as_ref(),
+            "headers_b64": headers_b64,
+            "status": upstream_status.as_u16()
+        }));
     }
 
     let inspect_resp_meta = InspectMeta {
@@ -453,6 +579,14 @@ async fn proxy_http(
             status = %out_resp.status(),
             "upstream"
         );
+        emit_structured_log(json!({
+            "type": "entry",
+            "event": "upstream",
+            "peer": peer.to_string(),
+            "method": method.as_str(),
+            "url": request_url.as_ref(),
+            "status": out_resp.status().as_u16()
+        }));
     }
 
     Ok(out_resp)
@@ -465,18 +599,11 @@ struct ResolvedTarget {
 }
 
 fn resolve_target(uri: &Uri, headers: &HeaderMap, ctx: &RequestContext) -> Result<ResolvedTarget> {
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
     if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
-        let scheme = scheme.to_string();
-        let authority = authority.to_string();
-        let full: Uri = format!("{scheme}://{authority}{path_and_query}")
-            .parse()
-            .context("failed to parse absolute URI")?;
         return Ok(ResolvedTarget {
-            scheme,
-            authority,
-            uri: full,
+            scheme: scheme.to_string(),
+            authority: authority.to_string(),
+            uri: uri.clone(),
         });
     }
 
@@ -488,13 +615,20 @@ fn resolve_target(uri: &Uri, headers: &HeaderMap, ctx: &RequestContext) -> Resul
         anyhow::bail!("missing Host header");
     };
 
-    let scheme = ctx.default_scheme.to_string();
-    let full: Uri = format!("{scheme}://{authority}{path_and_query}")
-        .parse()
+    let mut full_builder = Uri::builder()
+        .scheme(ctx.default_scheme)
+        .authority(authority.as_str());
+    full_builder = if let Some(path_and_query) = uri.path_and_query() {
+        full_builder.path_and_query(path_and_query.clone())
+    } else {
+        full_builder.path_and_query("/")
+    };
+    let full = full_builder
+        .build()
         .context("failed to build absolute URI")?;
 
     Ok(ResolvedTarget {
-        scheme,
+        scheme: ctx.default_scheme.to_string(),
         authority,
         uri: full,
     })
@@ -526,9 +660,10 @@ async fn map_local_response(
                 .content_type
                 .clone()
                 .unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
-            let bytes = Bytes::from(text.clone());
-            let mut resp = hyper::Response::new(boxed_body(Full::new(bytes.clone())));
-            apply_content_headers(resp.headers_mut(), &content_type, Some(bytes.len() as u64))?;
+            let bytes = Bytes::copy_from_slice(text.as_bytes());
+            let content_length = bytes.len() as u64;
+            let mut resp = hyper::Response::new(boxed_body(Full::new(bytes)));
+            apply_content_headers(resp.headers_mut(), &content_type, Some(content_length))?;
             resp
         }
     };
@@ -600,6 +735,10 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
     for h in HOP_BY_HOP {
         headers.remove(h);
     }
+}
+
+fn emit_structured_log(payload: serde_json::Value) {
+    tracing::info!("CRAB_JSON {}", payload);
 }
 
 #[cfg(test)]
@@ -683,10 +822,12 @@ mod tests {
 
     #[test]
     fn cert_portal_page_contains_platform_download_links() {
-        let html = build_cert_portal_page("http://crab-proxy.local", true);
+        let html = build_cert_portal_page("http://crab-proxy.local", Some("AA:BB:CC:DD:EE:FF"));
         assert!(html.contains("/android.crt"));
         assert!(html.contains("/ios.mobileconfig"));
         assert!(html.contains("/ca.pem"));
+        assert!(html.contains("SHA-256 Fingerprint"));
+        assert!(html.contains("AA:BB:CC:DD:EE:FF"));
     }
 
     #[test]
@@ -694,6 +835,25 @@ mod tests {
         let mobileconfig = build_ios_mobileconfig(&[1, 2, 3, 4]);
         assert!(mobileconfig.contains("<data>AQIDBA==</data>"));
         assert!(mobileconfig.contains("com.apple.security.root"));
+        assert!(mobileconfig.contains("<key>PayloadUUID</key>"));
+    }
+
+    #[test]
+    fn ios_mobileconfig_uuid_is_deterministic_per_certificate() {
+        let a = build_ios_mobileconfig(&[1, 2, 3, 4]);
+        let b = build_ios_mobileconfig(&[1, 2, 3, 4]);
+        let c = build_ios_mobileconfig(&[5, 6, 7, 8]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn cert_fingerprint_is_uppercase_sha256_hex() {
+        let fp = ca_cert_fingerprint_sha256(&[1, 2, 3, 4]);
+        assert_eq!(
+            fp,
+            "9F:64:A7:47:E1:B9:7F:13:1F:AB:B6:B4:47:29:6C:9B:6F:02:01:E7:9F:B3:C5:35:6E:6C:77:E8:9B:6A:80:6A"
+        );
     }
 
     #[test]
@@ -710,5 +870,54 @@ mod tests {
 
         assert!(text.contains("x-test: abc"));
         assert!(text.contains("content-type: application/json"));
+    }
+
+    #[test]
+    fn header_encoding_masks_sensitive_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer abc"));
+        headers.insert("cookie", HeaderValue::from_static("sid=secret"));
+        headers.insert("x-test", HeaderValue::from_static("ok"));
+
+        let encoded = encode_headers_for_log(&headers);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64 decode");
+        let text = String::from_utf8(decoded).expect("utf8");
+
+        assert!(text.contains("authorization: <redacted>"));
+        assert!(text.contains("cookie: <redacted>"));
+        assert!(text.contains("x-test: ok"));
+    }
+
+    #[test]
+    fn connect_policy_blocks_private_addresses_and_localhost() {
+        assert!(is_blocked_connect_host_literal("localhost"));
+        assert!(is_blocked_connect_host_literal("127.0.0.1"));
+        assert!(is_blocked_connect_host_literal("10.0.0.7"));
+        assert!(is_blocked_connect_host_literal("192.168.1.10"));
+        assert!(is_blocked_connect_host_literal("172.16.3.9"));
+        assert!(is_blocked_connect_host_literal("169.254.1.2"));
+        assert!(is_blocked_connect_host_literal("::1"));
+        assert!(is_blocked_connect_host_literal("fc00::1"));
+        assert!(is_blocked_connect_host_literal("fe80::1234"));
+    }
+
+    #[test]
+    fn connect_policy_allows_public_addresses() {
+        assert!(!is_blocked_connect_host_literal("1.1.1.1"));
+        assert!(!is_blocked_connect_host_literal("8.8.8.8"));
+        assert!(!is_blocked_connect_host_literal("2606:4700:4700::1111"));
+        assert!(!is_blocked_connect_host_literal("example.com"));
+    }
+
+    #[test]
+    fn parse_env_bool_default_true_supports_false_values() {
+        assert!(parse_env_bool_default_true(None));
+        assert!(!parse_env_bool_default_true(Some("false")));
+        assert!(!parse_env_bool_default_true(Some("0")));
+        assert!(!parse_env_bool_default_true(Some("off")));
+        assert!(!parse_env_bool_default_true(Some("no")));
+        assert!(parse_env_bool_default_true(Some("true")));
     }
 }

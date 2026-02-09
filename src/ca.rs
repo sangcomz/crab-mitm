@@ -2,13 +2,15 @@ use std::io::BufReader;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result};
 use lru::LruCache;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use time::{Duration, OffsetDateTime};
+use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::sync::Mutex as AsyncMutex;
 
 pub fn generate_ca_to_files(
     common_name: &str,
@@ -19,8 +21,8 @@ pub fn generate_ca_to_files(
     let key_pair = rcgen::KeyPair::generate().context("failed to generate CA key pair")?;
 
     let mut params = rcgen::CertificateParams::default();
-    params.not_before = OffsetDateTime::now_utc() - Duration::days(1);
-    params.not_after = OffsetDateTime::now_utc() + Duration::days(days as i64);
+    params.not_before = OffsetDateTime::now_utc() - TimeDuration::days(1);
+    params.not_after = OffsetDateTime::now_utc() + TimeDuration::days(days as i64);
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params
         .distinguished_name
@@ -67,15 +69,21 @@ fn write_private_key_pem(path: &Path, pem: &str) -> std::io::Result<()> {
 }
 
 pub struct CertificateAuthority {
-    signer: Mutex<Signer>,
+    signer: AsyncMutex<Signer>,
     ca_cert_pem: String,
     ca_cert_der: CertificateDer<'static>,
-    cache: tokio::sync::Mutex<LruCache<String, Arc<ServerConfig>>>,
+    cache: AsyncMutex<LruCache<String, CachedServerConfig>>,
+    cache_ttl: StdDuration,
 }
 
 struct Signer {
     issuer_cert: rcgen::Certificate,
     issuer_key: rcgen::KeyPair,
+}
+
+struct CachedServerConfig {
+    config: Arc<ServerConfig>,
+    expires_at: Instant,
 }
 
 impl CertificateAuthority {
@@ -97,15 +105,16 @@ impl CertificateAuthority {
             .context("failed to build CA signer certificate (internal)")?;
 
         Ok(Self {
-            signer: Mutex::new(Signer {
+            signer: AsyncMutex::new(Signer {
                 issuer_cert,
                 issuer_key,
             }),
             ca_cert_pem: cert_pem,
             ca_cert_der,
-            cache: tokio::sync::Mutex::new(LruCache::new(
+            cache: AsyncMutex::new(LruCache::new(
                 NonZeroUsize::new(2048).expect("non-zero cert cache size"),
             )),
+            cache_ttl: parse_leaf_cache_ttl(),
         })
     }
 
@@ -119,25 +128,48 @@ impl CertificateAuthority {
 
     pub async fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>> {
         let host = normalize_host(host);
+        let now = Instant::now();
         {
             let mut cache = self.cache.lock().await;
-            if let Some(cfg) = cache.get(&host).cloned() {
-                return Ok(cfg);
+            if let Some(cached) = cache.get(&host) {
+                if cached.expires_at > now {
+                    return Ok(cached.config.clone());
+                }
+            }
+            if cache.peek(&host).is_some() {
+                cache.pop(&host);
             }
         }
 
-        let cfg = Arc::new(self.build_server_config(&host)?);
-        self.cache.lock().await.put(host, cfg.clone());
-        Ok(cfg)
+        let built = Arc::new(self.build_server_config(&host).await?);
+        let expires_at = next_cache_expiry(self.cache_ttl);
+
+        let mut cache = self.cache.lock().await;
+        if let Some(existing) = cache.get(&host)
+            && existing.expires_at > Instant::now()
+        {
+            return Ok(existing.config.clone());
+        }
+        if cache.peek(&host).is_some() {
+            cache.pop(&host);
+        }
+        cache.put(
+            host,
+            CachedServerConfig {
+                config: built.clone(),
+                expires_at,
+            },
+        );
+        Ok(built)
     }
 
-    fn build_server_config(&self, host: &str) -> Result<ServerConfig> {
+    async fn build_server_config(&self, host: &str) -> Result<ServerConfig> {
         let leaf_key = rcgen::KeyPair::generate().context("failed to generate leaf key pair")?;
 
         let mut leaf_params = rcgen::CertificateParams::new([host.to_string()])
             .context("failed to build leaf params")?;
-        leaf_params.not_before = OffsetDateTime::now_utc() - Duration::days(1);
-        leaf_params.not_after = OffsetDateTime::now_utc() + Duration::days(365);
+        leaf_params.not_before = OffsetDateTime::now_utc() - TimeDuration::days(1);
+        leaf_params.not_after = OffsetDateTime::now_utc() + TimeDuration::days(365);
         leaf_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, host);
@@ -149,7 +181,7 @@ impl CertificateAuthority {
         leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
 
         let leaf_cert = {
-            let signer = self.signer.lock().expect("poisoned CA signer lock");
+            let signer = self.signer.lock().await;
             leaf_params
                 .signed_by(&leaf_key, &signer.issuer_cert, &signer.issuer_key)
                 .context("failed to sign leaf certificate")?
@@ -162,7 +194,7 @@ impl CertificateAuthority {
             .with_no_client_auth()
             .with_single_cert(chain, key)
             .context("failed to build rustls ServerConfig")?;
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(cfg)
     }
 }
@@ -180,4 +212,94 @@ fn load_first_cert_der(pem: &str) -> Result<CertificateDer<'static>> {
 
 fn normalize_host(host: &str) -> String {
     host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn parse_leaf_cache_ttl() -> StdDuration {
+    parse_leaf_cache_ttl_value(
+        std::env::var("CRAB_LEAF_CERT_CACHE_TTL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_leaf_cache_ttl_value(raw: Option<&str>) -> StdDuration {
+    const DEFAULT_SECS: u64 = 6 * 60 * 60;
+
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(StdDuration::from_secs)
+        .unwrap_or_else(|| StdDuration::from_secs(DEFAULT_SECS))
+}
+
+fn next_cache_expiry(ttl: StdDuration) -> Instant {
+    Instant::now().checked_add(ttl).unwrap_or_else(Instant::now)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("crab-mitm-{prefix}-{nanos}"))
+    }
+
+    #[test]
+    fn parse_leaf_cache_ttl_value_accepts_positive_seconds() {
+        assert_eq!(
+            parse_leaf_cache_ttl_value(Some("60")),
+            StdDuration::from_secs(60)
+        );
+        assert_eq!(
+            parse_leaf_cache_ttl_value(Some(" 120 ")),
+            StdDuration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn parse_leaf_cache_ttl_value_falls_back_on_invalid_input() {
+        let default_ttl = StdDuration::from_secs(6 * 60 * 60);
+        assert_eq!(parse_leaf_cache_ttl_value(None), default_ttl);
+        assert_eq!(parse_leaf_cache_ttl_value(Some("0")), default_ttl);
+        assert_eq!(parse_leaf_cache_ttl_value(Some("-1")), default_ttl);
+        assert_eq!(parse_leaf_cache_ttl_value(Some("abc")), default_ttl);
+    }
+
+    #[tokio::test]
+    async fn generated_leaf_config_advertises_h2_and_http11() {
+        let dir = unique_temp_dir("ca-alpn");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let cert = dir.join("ca.crt.pem");
+        let key = dir.join("ca.key.pem");
+
+        generate_ca_to_files("CrabProxy Test CA", 7, &cert, &key).expect("generate test CA");
+        let ca = CertificateAuthority::from_pem_files(&cert, &key).expect("load test CA");
+        let server_cfg = ca
+            .server_config_for_host("example.com")
+            .await
+            .expect("server config");
+
+        assert!(
+            server_cfg
+                .alpn_protocols
+                .iter()
+                .any(|v| v.as_slice() == b"h2")
+        );
+        assert!(
+            server_cfg
+                .alpn_protocols
+                .iter()
+                .any(|v| v.as_slice() == b"http/1.1")
+        );
+
+        let _ = fs::remove_file(cert);
+        let _ = fs::remove_file(key);
+        let _ = fs::remove_dir_all(dir);
+    }
 }

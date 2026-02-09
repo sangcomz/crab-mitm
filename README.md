@@ -14,7 +14,7 @@ Rust로 만든 간단한 MITM 프록시(HTTP/HTTPS)입니다. 네트워크 디�
 ## 설치/빌드
 
 ```bash
-cargo build --release
+cargo build --release --features cli
 cargo test
 ```
 
