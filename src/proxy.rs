@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::header::{HOST, HeaderName, HeaderValue};
@@ -21,7 +22,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use serde_json::json;
-use tokio::io::copy_bidirectional;
+use tokio::io::{AsyncReadExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
@@ -205,6 +206,8 @@ fn handle_connect(
     let host = authority.host().to_string();
     let port = authority.port_u16().unwrap_or(443);
     let authority_str = authority.to_string();
+    let target_url = format!("https://{authority_str}/");
+    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string();
     let on_upgrade = upgrade::on(req);
 
     if is_connect_target_blocked(&host, port) {
@@ -225,10 +228,36 @@ fn handle_connect(
     let rules = state.rules.clone();
     let client = state.client.clone();
     let inspect = state.inspect.clone();
+    let mitm_allowed = rules.is_allowed("https", &authority_str, "/");
+    let should_mitm = ca.is_some() && mitm_allowed;
+
+    if !should_mitm {
+        tracing::info!(
+            peer = %peer,
+            method = "CONNECT",
+            url = %target_url,
+            status = 200,
+            encrypted = true,
+            "tunnel"
+        );
+        emit_structured_log(json!({
+            "type": "entry",
+            "event": "tunnel",
+            "request_id": request_id,
+            "peer": peer.to_string(),
+            "method": "CONNECT",
+            "url": target_url,
+            "status": 200,
+            "encrypted": true
+        }));
+    }
+
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                if let Some(ca) = ca {
+                if let Some(ca) = ca
+                    && mitm_allowed
+                {
                     if let Err(err) = mitm_https(
                         upgraded,
                         peer,
@@ -479,6 +508,40 @@ async fn proxy_http(
             path_and_query,
             &mut resp,
         );
+        let map_local_status = resp.status();
+        strip_hop_headers(resp.headers_mut());
+
+        let headers_b64 = encode_headers_for_log(resp.headers());
+        tracing::info!(
+            peer = %peer,
+            method = %method,
+            url = %request_url,
+            status = %map_local_status,
+            headers_b64 = %headers_b64,
+            "response_headers"
+        );
+        emit_structured_log(json!({
+            "type": "meta",
+            "event": "response_headers",
+            "request_id": request_id.as_ref(),
+            "peer": peer.to_string(),
+            "method": method.as_str(),
+            "url": request_url.as_ref(),
+            "headers_b64": headers_b64,
+            "status": map_local_status.as_u16()
+        }));
+
+        emit_map_local_body_preview(
+            rule,
+            &state.inspect,
+            &request_id,
+            peer,
+            &method,
+            &request_url,
+            map_local_status,
+        )
+        .await;
+
         tracing::info!(
             peer = %peer,
             method = %method,
@@ -684,6 +747,90 @@ async fn map_local_response(
         HeaderValue::from_static("map_local"),
     );
     Ok(resp)
+}
+
+async fn emit_map_local_body_preview(
+    rule: &crate::rules::MapLocalRule,
+    inspect: &InspectConfig,
+    request_id: &Arc<str>,
+    peer: SocketAddr,
+    method: &Method,
+    request_url: &Arc<str>,
+    status: StatusCode,
+) {
+    if !inspect.enabled {
+        return;
+    }
+
+    let Ok((sample, body_bytes)) = map_local_body_sample(rule, inspect.sample_bytes).await else {
+        return;
+    };
+
+    let sample_bytes = sample.len();
+    let sample_b64 = base64::engine::general_purpose::STANDARD.encode(&sample);
+    tracing::info!(
+        request_id = %request_id,
+        peer = %peer,
+        method = %method,
+        url = %request_url,
+        direction = "response",
+        response_status = status.as_u16(),
+        body_bytes = body_bytes,
+        sample_bytes = sample_bytes,
+        sample_b64 = %sample_b64,
+        outcome = "complete",
+        error = "-",
+        "body inspection"
+    );
+    emit_structured_log(json!({
+        "type": "meta",
+        "event": "body_inspection",
+        "request_id": request_id.as_ref(),
+        "peer": peer.to_string(),
+        "method": method.as_str(),
+        "url": request_url.as_ref(),
+        "direction": "response",
+        "response_status": status.as_u16(),
+        "body_bytes": body_bytes,
+        "sample_b64": sample_b64,
+        "outcome": "complete",
+        "error": serde_json::Value::Null
+    }));
+}
+
+async fn map_local_body_sample(
+    rule: &crate::rules::MapLocalRule,
+    sample_limit: usize,
+) -> Result<(Vec<u8>, u64)> {
+    match &rule.source {
+        MapSource::Text(text) => {
+            let bytes = text.as_bytes();
+            let take = bytes.len().min(sample_limit);
+            Ok((bytes[..take].to_vec(), bytes.len() as u64))
+        }
+        MapSource::File(path) => {
+            let mut file = tokio::fs::File::open(path)
+                .await
+                .with_context(|| format!("failed to read map_local sample: {}", path.display()))?;
+            let body_bytes = file.metadata().await.ok().map(|m| m.len()).unwrap_or(0);
+
+            if sample_limit == 0 {
+                return Ok((Vec::new(), body_bytes));
+            }
+
+            let mut sample = vec![0u8; sample_limit];
+            let mut offset = 0usize;
+            while offset < sample_limit {
+                let read = file.read(&mut sample[offset..]).await?;
+                if read == 0 {
+                    break;
+                }
+                offset += read;
+            }
+            sample.truncate(offset);
+            Ok((sample, body_bytes.max(offset as u64)))
+        }
+    }
 }
 
 fn apply_status_rewrite<B>(
