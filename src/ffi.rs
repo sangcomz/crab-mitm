@@ -8,7 +8,7 @@ use http::StatusCode;
 use tokio::sync::watch;
 
 use crate::ca::{self, CertificateAuthority};
-use crate::proxy::{self, InspectConfig};
+use crate::proxy::{self, InspectConfig, TransparentConfig};
 use crate::rules::{AllowRule, MapLocalRule, MapSource, Matcher, Rules, StatusRewriteRule};
 
 const CRAB_OK: i32 = 0;
@@ -24,6 +24,7 @@ pub struct CrabProxyHandle {
     ca: Mutex<Option<Arc<CertificateAuthority>>>,
     rules: Mutex<Rules>,
     inspect: Mutex<InspectConfig>,
+    transparent: Mutex<TransparentConfig>,
     shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
     task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     running: Arc<AtomicBool>,
@@ -513,6 +514,7 @@ pub extern "C" fn crab_proxy_create(
                 spool_dir: None,
                 spool_max_bytes: 100 * 1024 * 1024,
             }),
+            transparent: Mutex::new(TransparentConfig::default()),
             shutdown_tx: Mutex::new(None),
             task: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
@@ -600,6 +602,37 @@ pub extern "C" fn crab_proxy_set_inspect_enabled(
         ffi_with_handle!(handle, h, {
             let mut guard = ffi_lock!(h.inspect, "inspect");
             guard.enabled = enabled;
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_set_transparent_enabled(
+    handle: *mut CrabProxyHandle,
+    enabled: bool,
+) -> CrabResult {
+    ffi_entry!({
+        ffi_with_stopped_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.transparent, "transparent");
+            guard.enabled = enabled;
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_set_transparent_port(
+    handle: *mut CrabProxyHandle,
+    port: u16,
+) -> CrabResult {
+    ffi_entry!({
+        if port == 0 {
+            return err_result(CRAB_ERR_INVALID_ARG, "transparent port must be > 0");
+        }
+        ffi_with_stopped_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.transparent, "transparent");
+            guard.listen_port = port;
             ok_result()
         })
     })
@@ -751,6 +784,7 @@ pub extern "C" fn crab_proxy_start(handle: *mut CrabProxyHandle) -> CrabResult {
             let ca = ffi_lock!(h.ca, "ca").clone();
             let rules = Arc::new(ffi_lock!(h.rules, "rules").clone());
             let inspect = Arc::new(ffi_lock!(h.inspect, "inspect").clone());
+            let transparent = ffi_lock!(h.transparent, "transparent").clone();
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             {
@@ -762,8 +796,15 @@ pub extern "C" fn crab_proxy_start(handle: *mut CrabProxyHandle) -> CrabResult {
             running.store(true, Ordering::SeqCst);
 
             let task = h.runtime.spawn(async move {
-                let result =
-                    proxy::run_with_shutdown(&listen, ca, rules, inspect, shutdown_rx).await;
+                let result = proxy::run_with_shutdown(
+                    &listen,
+                    ca,
+                    rules,
+                    inspect,
+                    Some(transparent),
+                    shutdown_rx,
+                )
+                .await;
                 running.store(false, Ordering::SeqCst);
                 result
             });

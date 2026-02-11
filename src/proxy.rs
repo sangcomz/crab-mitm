@@ -35,10 +35,12 @@ use crate::rules::{MapSource, Rules};
 mod cert_portal;
 mod inspect;
 mod response;
+pub mod transparent;
 
 use cert_portal::maybe_handle_cert_portal;
 use inspect::{InspectMeta, encode_headers_for_log, maybe_inspect_body};
 use response::{apply_content_headers, text_response};
+pub use transparent::TransparentConfig;
 
 #[cfg(test)]
 use cert_portal::{
@@ -67,6 +69,7 @@ struct ProxyState {
     rules: Arc<Rules>,
     ca: Option<Arc<CertificateAuthority>>,
     inspect: Arc<InspectConfig>,
+    transparent: bool,
 }
 
 #[derive(Clone)]
@@ -80,6 +83,7 @@ pub async fn run(
     ca: Option<Arc<CertificateAuthority>>,
     rules: Arc<Rules>,
     inspect: Arc<InspectConfig>,
+    transparent: Option<TransparentConfig>,
 ) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -87,7 +91,7 @@ pub async fn run(
         let _ = shutdown_tx.send(true);
     });
 
-    run_with_shutdown(listen, ca, rules, inspect, shutdown_rx).await
+    run_with_shutdown(listen, ca, rules, inspect, transparent, shutdown_rx).await
 }
 
 pub async fn run_with_shutdown(
@@ -95,18 +99,39 @@ pub async fn run_with_shutdown(
     ca: Option<Arc<CertificateAuthority>>,
     rules: Arc<Rules>,
     inspect: Arc<InspectConfig>,
+    transparent: Option<TransparentConfig>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("failed to bind: {listen}"))?;
 
+    let transparent_listener = match transparent.as_ref() {
+        Some(cfg) if cfg.enabled => {
+            let addr = format!("127.0.0.1:{}", cfg.listen_port);
+            let tl = TcpListener::bind(&addr)
+                .await
+                .with_context(|| format!("failed to bind transparent listener: {addr}"))?;
+            tracing::info!(listen = %addr, "transparent proxy listening");
+            Some(tl)
+        }
+        _ => None,
+    };
+
     let client = build_client()?;
-    let state = ProxyState {
+    let forward_state = ProxyState {
+        client: client.clone(),
+        rules: rules.clone(),
+        ca: ca.clone(),
+        inspect: inspect.clone(),
+        transparent: false,
+    };
+    let transparent_state = ProxyState {
         client,
         rules,
         ca,
         inspect,
+        transparent: true,
     };
 
     tracing::info!(listen = %listen, "proxy listening");
@@ -115,12 +140,22 @@ pub async fn run_with_shutdown(
         tokio::select! {
             res = listener.accept() => {
                 let (stream, peer) = res?;
-                let state = state.clone();
+                let state = forward_state.clone();
                 tokio::spawn(async move {
                     if let Err(err) = serve_client(stream, peer, state).await {
                         tracing::debug!(peer = %peer, error = %err, "connection ended");
                     }
                 });
+            }
+            res = accept_transparent(&transparent_listener) => {
+                if let Some((stream, peer)) = res? {
+                    let state = transparent_state.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = serve_transparent_client(stream, peer, state).await {
+                            tracing::debug!(peer = %peer, error = %err, "transparent connection ended");
+                        }
+                    });
+                }
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_ok() && *shutdown_rx.borrow() {
@@ -134,6 +169,21 @@ pub async fn run_with_shutdown(
     }
 
     Ok(())
+}
+
+async fn accept_transparent(
+    listener: &Option<TcpListener>,
+) -> Result<Option<(TcpStream, SocketAddr)>> {
+    match listener {
+        Some(tl) => {
+            let (stream, peer) = tl.accept().await?;
+            Ok(Some((stream, peer)))
+        }
+        None => {
+            std::future::pending::<()>().await;
+            Ok(None)
+        }
+    }
 }
 
 fn build_client() -> Result<HttpClient> {
@@ -167,6 +217,54 @@ fn build_client() -> Result<HttpClient> {
         .build();
 
     Ok(Client::builder(TokioExecutor::new()).build(https))
+}
+
+async fn transparent_upstream_request(
+    req: hyper::Request<ProxyBody>,
+    target: &ResolvedTarget,
+) -> Result<hyper::Response<Incoming>> {
+    let host = target
+        .uri
+        .host()
+        .context("missing host in URI for transparent upstream")?;
+    let port = target.uri.port_u16().unwrap_or(if target.scheme == "https" {
+        443
+    } else {
+        80
+    });
+
+    let addr = transparent::resolve_host(host, port).await?;
+    let tcp_stream = transparent::connect_transparent(addr).await?;
+
+    if target.scheme == "https" {
+        let tls_config = transparent::build_upstream_tls_config()?;
+        let connector = tokio_rustls::TlsConnector::from(tls_config);
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| anyhow::anyhow!("invalid SNI: {host}"))?;
+        let tls_stream = connector
+            .connect(server_name, tcp_stream)
+            .await
+            .context("transparent upstream TLS connect failed")?;
+        let io = TokioIo::new(tls_stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .context("transparent upstream HTTP/1 handshake failed")?;
+        tokio::spawn(conn);
+        sender
+            .send_request(req)
+            .await
+            .context("transparent upstream request failed")
+    } else {
+        let io = TokioIo::new(tcp_stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .context("transparent upstream HTTP/1 handshake failed")?;
+        tokio::spawn(conn);
+        sender
+            .send_request(req)
+            .await
+            .context("transparent upstream request failed")
+    }
 }
 
 async fn serve_client(stream: TcpStream, peer: SocketAddr, state: ProxyState) -> Result<()> {
@@ -321,6 +419,98 @@ async fn tunnel_tcp(client_io: upgrade::Upgraded, host: &str, port: u16) -> Resu
     Ok(())
 }
 
+async fn serve_transparent_client(
+    stream: TcpStream,
+    peer: SocketAddr,
+    state: ProxyState,
+) -> Result<()> {
+    let mut peek_buf = [0u8; 1];
+    stream
+        .peek(&mut peek_buf)
+        .await
+        .context("failed to peek first byte on transparent connection")?;
+
+    if peek_buf[0] == 0x16 {
+        serve_transparent_https(stream, peer, state).await
+    } else {
+        serve_transparent_http(stream, peer, state).await
+    }
+}
+
+async fn serve_transparent_https(
+    stream: TcpStream,
+    peer: SocketAddr,
+    state: ProxyState,
+) -> Result<()> {
+    let ca = state
+        .ca
+        .as_ref()
+        .context("transparent HTTPS requires CA to be loaded")?;
+
+    let accepted = transparent::accept_tls_with_sni(stream, ca)
+        .await
+        .context("transparent SNI extraction failed")?;
+
+    tracing::info!(peer = %peer, sni = %accepted.hostname, "transparent HTTPS");
+
+    let authority = accepted.hostname;
+    let io = TokioIo::new(accepted.tls_stream);
+    let ctx = RequestContext {
+        default_scheme: "https",
+        default_authority: Some(authority),
+    };
+
+    let svc = service_fn(move |req: hyper::Request<Incoming>| {
+        let state = state.clone();
+        let ctx = ctx.clone();
+        async move { Ok::<_, Infallible>(handle_request(req, peer, state, ctx).await) }
+    });
+
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .preserve_header_case(true)
+        .title_case_headers(true);
+    builder
+        .serve_connection_with_upgrades(io, svc)
+        .await
+        .map_err(|err| anyhow::anyhow!("serve_connection (transparent TLS) failed: {err}"))?;
+
+    Ok(())
+}
+
+async fn serve_transparent_http(
+    stream: TcpStream,
+    peer: SocketAddr,
+    state: ProxyState,
+) -> Result<()> {
+    tracing::info!(peer = %peer, "transparent HTTP");
+
+    let io = TokioIo::new(stream);
+    let ctx = RequestContext {
+        default_scheme: "http",
+        default_authority: None,
+    };
+
+    let svc = service_fn(move |req: hyper::Request<Incoming>| {
+        let state = state.clone();
+        let ctx = ctx.clone();
+        async move { Ok::<_, Infallible>(handle_request(req, peer, state, ctx).await) }
+    });
+
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .preserve_header_case(true)
+        .title_case_headers(true);
+    builder
+        .serve_connection_with_upgrades(io, svc)
+        .await
+        .map_err(|err| anyhow::anyhow!("serve_connection (transparent HTTP) failed: {err}"))?;
+
+    Ok(())
+}
+
 fn is_connect_target_blocked(host: &str, port: u16) -> bool {
     if !connect_private_block_enabled() {
         return false;
@@ -422,6 +612,7 @@ async fn mitm_https(
         rules,
         ca: Some(ca),
         inspect,
+        transparent: false,
     };
 
     let svc = service_fn(move |req: hyper::Request<Incoming>| {
@@ -607,11 +798,15 @@ async fn proxy_http(
     strip_hop_headers(out_req.headers_mut());
     ensure_host_header(out_req.headers_mut(), &target.authority)?;
 
-    let upstream_resp = state
-        .client
-        .request(out_req)
-        .await
-        .context("upstream request failed")?;
+    let upstream_resp = if state.transparent {
+        transparent_upstream_request(out_req, &target).await?
+    } else {
+        state
+            .client
+            .request(out_req)
+            .await
+            .context("upstream request failed")?
+    };
     let (mut resp_parts, resp_body) = upstream_resp.into_parts();
 
     strip_hop_headers(&mut resp_parts.headers);

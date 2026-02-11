@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            proxy::run(&args.listen, ca, rules, inspect).await
+            proxy::run(&args.listen, ca, rules, inspect, None).await
         }
     }
 }

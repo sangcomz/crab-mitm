@@ -32,6 +32,8 @@ CrabResult crab_proxy_set_listen_addr(CrabProxyHandle *handle, const char *liste
 CrabResult crab_proxy_set_port(CrabProxyHandle *handle, uint16_t port);
 CrabResult crab_proxy_load_ca(CrabProxyHandle *handle, const char *cert_path, const char *key_path);
 CrabResult crab_proxy_set_inspect_enabled(CrabProxyHandle *handle, bool enabled);
+CrabResult crab_proxy_set_transparent_enabled(CrabProxyHandle *handle, bool enabled);
+CrabResult crab_proxy_set_transparent_port(CrabProxyHandle *handle, uint16_t port);
 CrabResult crab_proxy_rules_clear(CrabProxyHandle *handle);
 CrabResult crab_proxy_rules_add_allow(
     CrabProxyHandle *handle,
