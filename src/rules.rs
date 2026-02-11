@@ -85,6 +85,37 @@ impl AllowRule {
                 && host_lc.ends_with(&raw_lc)
                 && host_lc.as_bytes()[host_lc.len() - raw_lc.len() - 1] == b'.')
     }
+
+    pub fn is_ssl_proxy_match(&self, scheme: &str, authority: &str) -> bool {
+        let raw = self.raw.trim();
+        if raw.is_empty() {
+            return false;
+        }
+        if raw == "*" || raw == "*.*" {
+            return true;
+        }
+
+        let authority_pattern = if is_full_url_pattern(raw) {
+            let Some((raw_scheme, remainder)) = raw.split_once("://") else {
+                return false;
+            };
+            if !scheme.eq_ignore_ascii_case(raw_scheme) {
+                return false;
+            }
+            remainder.split('/').next().unwrap_or("")
+        } else {
+            if raw.starts_with('/') {
+                return false;
+            }
+            raw.split('/').next().unwrap_or(raw)
+        };
+
+        if authority_pattern.is_empty() {
+            return false;
+        }
+
+        matches_authority_pattern(authority, authority_pattern)
+    }
 }
 
 fn extract_host(authority: &str) -> &str {
@@ -94,6 +125,60 @@ fn extract_host(authority: &str) -> &str {
         return &rest[..close];
     }
     authority.split(':').next().unwrap_or(authority)
+}
+
+fn split_host_port(value: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = value.strip_prefix('[')
+        && let Some(close) = rest.find(']')
+    {
+        let host = &rest[..close];
+        let remainder = &rest[close + 1..];
+        if let Some(port) = remainder.strip_prefix(':')
+            && !port.is_empty()
+        {
+            return (host, Some(port));
+        }
+        return (host, None);
+    }
+
+    if let Some((host, port)) = value.rsplit_once(':')
+        && !host.is_empty()
+        && !port.is_empty()
+        && port.as_bytes().iter().all(|byte| byte.is_ascii_digit())
+    {
+        return (host, Some(port));
+    }
+
+    (value, None)
+}
+
+fn matches_authority_pattern(authority: &str, pattern: &str) -> bool {
+    let (pattern_host, pattern_port) = split_host_port(pattern);
+    if pattern_host.is_empty() {
+        return false;
+    }
+
+    let (authority_host, authority_port) = split_host_port(authority);
+    if let Some(pattern_port) = pattern_port
+        && authority_port != Some(pattern_port)
+    {
+        return false;
+    }
+
+    let authority_host_lc = authority_host.to_ascii_lowercase();
+    let pattern_host_lc = pattern_host.to_ascii_lowercase();
+
+    if let Some(suffix) = pattern_host_lc.strip_prefix("*.") {
+        return authority_host_lc.len() > suffix.len()
+            && authority_host_lc.ends_with(suffix)
+            && authority_host_lc.as_bytes()[authority_host_lc.len() - suffix.len() - 1] == b'.';
+    }
+
+    authority_host_lc == pattern_host_lc
+        || (authority_host_lc.len() > pattern_host_lc.len()
+            && authority_host_lc.ends_with(&pattern_host_lc)
+            && authority_host_lc.as_bytes()[authority_host_lc.len() - pattern_host_lc.len() - 1]
+                == b'.')
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +271,15 @@ impl Rules {
         self.allowlist
             .iter()
             .any(|rule| rule.is_match(scheme, authority, path_and_query))
+    }
+
+    pub fn is_mitm_allowed(&self, scheme: &str, authority: &str) -> bool {
+        if self.allowlist.is_empty() {
+            return false;
+        }
+        self.allowlist
+            .iter()
+            .any(|rule| rule.is_ssl_proxy_match(scheme, authority))
     }
 
     pub fn find_map_local(
@@ -290,5 +384,31 @@ mod tests {
     fn rules_default_allows_everything_without_allowlist() {
         let rules = Rules::default();
         assert!(rules.is_allowed("https", "example.com", "/"));
+    }
+
+    #[test]
+    fn allow_rule_ssl_proxy_match_uses_authority_only() {
+        let rule = AllowRule::new("https://example.com/api/v1");
+        assert!(rule.is_ssl_proxy_match("https", "example.com:443"));
+        assert!(!rule.is_ssl_proxy_match("http", "example.com:80"));
+    }
+
+    #[test]
+    fn allow_rule_ssl_proxy_match_supports_port_pattern() {
+        let rule = AllowRule::new("example.com:8443");
+        assert!(rule.is_ssl_proxy_match("https", "example.com:8443"));
+        assert!(!rule.is_ssl_proxy_match("https", "example.com:443"));
+    }
+
+    #[test]
+    fn allow_rule_ssl_proxy_match_rejects_path_only_pattern() {
+        let rule = AllowRule::new("/graphql");
+        assert!(!rule.is_ssl_proxy_match("https", "example.com:443"));
+    }
+
+    #[test]
+    fn rules_default_disallows_mitm_without_allowlist() {
+        let rules = Rules::default();
+        assert!(!rules.is_mitm_allowed("https", "example.com:443"));
     }
 }

@@ -228,7 +228,7 @@ fn handle_connect(
     let rules = state.rules.clone();
     let client = state.client.clone();
     let inspect = state.inspect.clone();
-    let mitm_allowed = rules.is_allowed("https", &authority_str, "/");
+    let mitm_allowed = rules.is_mitm_allowed("https", &authority_str);
     let should_mitm = ca.is_some() && mitm_allowed;
 
     if !should_mitm {
@@ -320,12 +320,12 @@ fn is_connect_target_blocked(host: &str, port: u16) -> bool {
 }
 
 fn connect_private_block_enabled() -> bool {
-    parse_env_bool_default_true(std::env::var("CRAB_CONNECT_BLOCK_PRIVATE").ok().as_deref())
+    parse_env_bool_default_false(std::env::var("CRAB_CONNECT_BLOCK_PRIVATE").ok().as_deref())
 }
 
-fn parse_env_bool_default_true(raw: Option<&str>) -> bool {
+fn parse_env_bool_default_false(raw: Option<&str>) -> bool {
     match raw.map(str::trim) {
-        None => true,
+        None => false,
         Some(value)
             if value.eq_ignore_ascii_case("0")
                 || value.eq_ignore_ascii_case("false")
@@ -1070,12 +1070,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_bool_default_true_supports_false_values() {
-        assert!(parse_env_bool_default_true(None));
-        assert!(!parse_env_bool_default_true(Some("false")));
-        assert!(!parse_env_bool_default_true(Some("0")));
-        assert!(!parse_env_bool_default_true(Some("off")));
-        assert!(!parse_env_bool_default_true(Some("no")));
-        assert!(parse_env_bool_default_true(Some("true")));
+    fn parse_env_bool_default_false_supports_false_values() {
+        assert!(!parse_env_bool_default_false(None));
+        assert!(!parse_env_bool_default_false(Some("false")));
+        assert!(!parse_env_bool_default_false(Some("0")));
+        assert!(!parse_env_bool_default_false(Some("off")));
+        assert!(!parse_env_bool_default_false(Some("no")));
+        assert!(parse_env_bool_default_false(Some("true")));
     }
 }
