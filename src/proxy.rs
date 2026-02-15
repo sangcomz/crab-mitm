@@ -21,6 +21,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
+use rustls::RootCertStore;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
@@ -136,9 +137,30 @@ pub async fn run_with_shutdown(
 }
 
 fn build_client() -> Result<HttpClient> {
+    let mut root_store = RootCertStore::empty();
+    
+    let roots = rustls_native_certs::load_native_certs();
+    
+    if let Some(err) = roots.errors.first() {
+        tracing::warn!(error = %err, "error loading some native root certificates");
+    }
+    
+    for cert in roots.certs {
+        if let Err(err) = root_store.add(cert) {
+            tracing::warn!(error = %err, "skipping invalid native root certificate");
+        }
+    }
+    
+    if root_store.is_empty() {
+        tracing::error!("no valid root certificates loaded — upstream TLS will fail");
+    }
+
     let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .context("failed to load native root certs")?
+        .with_tls_config(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        )
         .https_or_http()
         .enable_http1()
         .enable_http2()
@@ -320,12 +342,27 @@ fn is_connect_target_blocked(host: &str, port: u16) -> bool {
 }
 
 fn connect_private_block_enabled() -> bool {
-    parse_env_bool_default_false(std::env::var("CRAB_CONNECT_BLOCK_PRIVATE").ok().as_deref())
+    parse_env_bool_default_true(std::env::var("CRAB_CONNECT_BLOCK_PRIVATE").ok().as_deref())
 }
 
 fn parse_env_bool_default_false(raw: Option<&str>) -> bool {
     match raw.map(str::trim) {
         None => false,
+        Some(value)
+            if value.eq_ignore_ascii_case("0")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no") =>
+        {
+            false
+        }
+        Some(_) => true,
+    }
+}
+
+fn parse_env_bool_default_true(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None => true,
         Some(value)
             if value.eq_ignore_ascii_case("0")
                 || value.eq_ignore_ascii_case("false")
@@ -1077,5 +1114,15 @@ mod tests {
         assert!(!parse_env_bool_default_false(Some("off")));
         assert!(!parse_env_bool_default_false(Some("no")));
         assert!(parse_env_bool_default_false(Some("true")));
+    }
+
+    #[test]
+    fn parse_env_bool_default_true_supports_false_values() {
+        assert!(parse_env_bool_default_true(None));
+        assert!(!parse_env_bool_default_true(Some("false")));
+        assert!(!parse_env_bool_default_true(Some("0")));
+        assert!(!parse_env_bool_default_true(Some("off")));
+        assert!(!parse_env_bool_default_true(Some("no")));
+        assert!(parse_env_bool_default_true(Some("true")));
     }
 }
