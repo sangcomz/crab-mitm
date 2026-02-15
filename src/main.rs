@@ -129,6 +129,7 @@ async fn main() -> Result<()> {
                 spool_dir: args.inspect_spool_dir.clone(),
                 spool_max_bytes: args.inspect_spool_max_bytes,
             });
+            let throttle = Arc::new(proxy::ThrottleConfig::default());
 
             let ca =
                 match (&args.ca_cert, &args.ca_key) {
@@ -162,7 +163,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            proxy::run(&args.listen, ca, rules, inspect, None).await
+            proxy::run(&args.listen, ca, rules, inspect, throttle, None).await
         }
     }
 }

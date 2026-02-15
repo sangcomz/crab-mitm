@@ -32,6 +32,13 @@ CrabResult crab_proxy_set_listen_addr(CrabProxyHandle *handle, const char *liste
 CrabResult crab_proxy_set_port(CrabProxyHandle *handle, uint16_t port);
 CrabResult crab_proxy_load_ca(CrabProxyHandle *handle, const char *cert_path, const char *key_path);
 CrabResult crab_proxy_set_inspect_enabled(CrabProxyHandle *handle, bool enabled);
+CrabResult crab_proxy_set_throttle_enabled(CrabProxyHandle *handle, bool enabled);
+CrabResult crab_proxy_set_throttle_latency_ms(CrabProxyHandle *handle, uint64_t latency_ms);
+CrabResult crab_proxy_set_throttle_downstream_bps(CrabProxyHandle *handle, uint64_t downstream_bps);
+CrabResult crab_proxy_set_throttle_upstream_bps(CrabProxyHandle *handle, uint64_t upstream_bps);
+CrabResult crab_proxy_set_throttle_only_selected_hosts(CrabProxyHandle *handle, bool enabled);
+CrabResult crab_proxy_throttle_hosts_clear(CrabProxyHandle *handle);
+CrabResult crab_proxy_throttle_hosts_add(CrabProxyHandle *handle, const char *matcher);
 CrabResult crab_proxy_set_transparent_enabled(CrabProxyHandle *handle, bool enabled);
 CrabResult crab_proxy_set_transparent_port(CrabProxyHandle *handle, uint16_t port);
 CrabResult crab_proxy_rules_clear(CrabProxyHandle *handle);

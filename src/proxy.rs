@@ -26,7 +26,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use rustls::RootCertStore;
 use serde_json::json;
-use tokio::io::{AsyncReadExt, copy_bidirectional};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
@@ -35,16 +35,18 @@ use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
 
 use crate::ca::CertificateAuthority;
-use crate::rules::{MapSource, Rules};
+use crate::rules::{AllowRule, MapSource, Rules};
 
 mod cert_portal;
 mod inspect;
 mod response;
+mod throttle;
 pub mod transparent;
 
 use cert_portal::maybe_handle_cert_portal;
 use inspect::{InspectMeta, encode_headers_for_log, maybe_inspect_body};
 use response::{apply_content_headers, text_response};
+use throttle::{maybe_throttle_body, maybe_throttle_body_with_rate};
 pub use transparent::TransparentConfig;
 
 #[cfg(test)]
@@ -68,12 +70,45 @@ pub struct InspectConfig {
     pub spool_max_bytes: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ThrottleConfig {
+    pub enabled: bool,
+    pub latency_ms: u64,
+    pub downstream_bytes_per_sec: u64,
+    pub upstream_bytes_per_sec: u64,
+    pub only_selected_hosts: bool,
+    pub selected_hosts: Vec<AllowRule>,
+}
+
+impl ThrottleConfig {
+    fn has_throttle_limits(&self) -> bool {
+        self.latency_ms > 0 || self.downstream_bytes_per_sec > 0 || self.upstream_bytes_per_sec > 0
+    }
+
+    fn matches_location(&self, scheme: &str, authority: &str) -> bool {
+        if !self.only_selected_hosts {
+            return true;
+        }
+        if self.selected_hosts.is_empty() {
+            return false;
+        }
+        self.selected_hosts
+            .iter()
+            .any(|rule| rule.is_ssl_proxy_match(scheme, authority))
+    }
+
+    fn is_active_for(&self, scheme: &str, authority: &str) -> bool {
+        self.enabled && self.has_throttle_limits() && self.matches_location(scheme, authority)
+    }
+}
+
 #[derive(Clone)]
 struct ProxyState {
     client: HttpClient,
     rules: Arc<Rules>,
     ca: Option<Arc<CertificateAuthority>>,
     inspect: Arc<InspectConfig>,
+    throttle: Arc<ThrottleConfig>,
     plugin: Option<Arc<PluginRuntime>>,
     transparent: bool,
 }
@@ -138,6 +173,7 @@ pub async fn run(
     ca: Option<Arc<CertificateAuthority>>,
     rules: Arc<Rules>,
     inspect: Arc<InspectConfig>,
+    throttle: Arc<ThrottleConfig>,
     transparent: Option<TransparentConfig>,
 ) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -146,7 +182,16 @@ pub async fn run(
         let _ = shutdown_tx.send(true);
     });
 
-    run_with_shutdown(listen, ca, rules, inspect, transparent, shutdown_rx).await
+    run_with_shutdown(
+        listen,
+        ca,
+        rules,
+        inspect,
+        throttle,
+        transparent,
+        shutdown_rx,
+    )
+    .await
 }
 
 pub async fn run_with_shutdown(
@@ -154,6 +199,7 @@ pub async fn run_with_shutdown(
     ca: Option<Arc<CertificateAuthority>>,
     rules: Arc<Rules>,
     inspect: Arc<InspectConfig>,
+    throttle: Arc<ThrottleConfig>,
     transparent: Option<TransparentConfig>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -201,6 +247,7 @@ pub async fn run_with_shutdown(
         rules: rules.clone(),
         ca: ca.clone(),
         inspect: inspect.clone(),
+        throttle: throttle.clone(),
         plugin: plugin.clone(),
         transparent: false,
     };
@@ -209,6 +256,7 @@ pub async fn run_with_shutdown(
         rules,
         ca,
         inspect,
+        throttle,
         plugin,
         transparent: true,
     };
@@ -464,6 +512,7 @@ fn handle_connect(
     let rules = state.rules.clone();
     let client = state.client.clone();
     let inspect = state.inspect.clone();
+    let throttle = state.throttle.clone();
     let plugin = state.plugin.clone();
     let mitm_allowed = rules.is_mitm_allowed("https", &authority_str);
     let should_mitm = ca.is_some() && mitm_allowed;
@@ -508,13 +557,16 @@ fn handle_connect(
                         rules,
                         client,
                         inspect,
+                        throttle,
                         plugin,
                     )
                     .await
                     {
                         tracing::warn!(peer = %peer, target = %authority_str, error = %err, "MITM tunnel failed");
                     }
-                } else if let Err(err) = tunnel_tcp(upgraded, &host, port).await {
+                } else if let Err(err) =
+                    tunnel_tcp(upgraded, &authority_str, &host, port, throttle.as_ref()).await
+                {
                     tracing::warn!(peer = %peer, target = %authority_str, error = %err, "TCP tunnel failed");
                 }
             }
@@ -530,15 +582,117 @@ fn handle_connect(
         .expect("response builder")
 }
 
-async fn tunnel_tcp(client_io: upgrade::Upgraded, host: &str, port: u16) -> Result<()> {
+async fn tunnel_tcp(
+    client_io: upgrade::Upgraded,
+    authority: &str,
+    host: &str,
+    port: u16,
+    throttle: &ThrottleConfig,
+) -> Result<()> {
     let mut client_io = TokioIo::new(client_io);
-    let mut upstream = TcpStream::connect((host, port))
+    let upstream = TcpStream::connect((host, port))
         .await
         .with_context(|| format!("failed to connect upstream: {host}:{port}"))?;
-    let _ = copy_bidirectional(&mut client_io, &mut upstream)
-        .await
-        .context("tunnel copy_bidirectional failed")?;
+
+    let throttle_active = throttle.is_active_for("https", authority);
+    if !throttle_active {
+        let mut upstream = upstream;
+        let _ = copy_bidirectional(&mut client_io, &mut upstream)
+            .await
+            .context("tunnel copy_bidirectional failed")?;
+        return Ok(());
+    }
+
+    if throttle.latency_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(throttle.latency_ms)).await;
+    }
+
+    if throttle.upstream_bytes_per_sec == 0 && throttle.downstream_bytes_per_sec == 0 {
+        let mut upstream = upstream;
+        let _ = copy_bidirectional(&mut client_io, &mut upstream)
+            .await
+            .context("tunnel copy_bidirectional failed")?;
+        return Ok(());
+    }
+
+    tunnel_tcp_throttled(
+        client_io,
+        upstream,
+        throttle.upstream_bytes_per_sec,
+        throttle.downstream_bytes_per_sec,
+    )
+    .await?;
     Ok(())
+}
+
+async fn tunnel_tcp_throttled(
+    client_io: TokioIo<upgrade::Upgraded>,
+    upstream: TcpStream,
+    upstream_bytes_per_sec: u64,
+    downstream_bytes_per_sec: u64,
+) -> Result<()> {
+    let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
+    let (mut upstream_reader, mut upstream_writer) = tokio::io::split(upstream);
+
+    tokio::try_join!(
+        copy_stream_with_rate(
+            &mut client_reader,
+            &mut upstream_writer,
+            upstream_bytes_per_sec
+        ),
+        copy_stream_with_rate(
+            &mut upstream_reader,
+            &mut client_writer,
+            downstream_bytes_per_sec
+        ),
+    )
+    .context("tunnel throttled copy failed")?;
+    Ok(())
+}
+
+async fn copy_stream_with_rate<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    bytes_per_sec: u64,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut transferred: u64 = 0;
+    let mut buffer = [0u8; 16 * 1024];
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(transferred);
+        }
+
+        writer.write_all(&buffer[..read]).await?;
+        transferred = transferred.saturating_add(read as u64);
+
+        if let Some(delay) = throttle_delay_for_transfer(read as u64, bytes_per_sec) {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+fn throttle_delay_for_transfer(bytes: u64, bytes_per_sec: u64) -> Option<Duration> {
+    if bytes == 0 || bytes_per_sec == 0 {
+        return None;
+    }
+
+    let nanos = (bytes as u128)
+        .saturating_mul(1_000_000_000u128)
+        .checked_div(bytes_per_sec as u128)
+        .unwrap_or(0);
+    if nanos == 0 {
+        return None;
+    }
+
+    let nanos = nanos.min(u64::MAX as u128) as u64;
+    Some(Duration::from_nanos(nanos))
 }
 
 async fn serve_transparent_client(
@@ -845,6 +999,7 @@ async fn mitm_https(
     rules: Arc<Rules>,
     client: HttpClient,
     inspect: Arc<InspectConfig>,
+    throttle: Arc<ThrottleConfig>,
     plugin: Option<Arc<PluginRuntime>>,
 ) -> Result<()> {
     let upstream_sans = if upstream_san_sniff_enabled() {
@@ -872,6 +1027,7 @@ async fn mitm_https(
         rules,
         ca: Some(ca),
         inspect,
+        throttle,
         plugin,
         transparent: false,
     };
@@ -1210,7 +1366,13 @@ async fn proxy_http(
                 "response_size_bytes": response_size_bytes
             }),
         );
-        return Ok(resp);
+        return Ok(maybe_apply_response_throttle(
+            resp,
+            &state.throttle,
+            &target.scheme,
+            &target.authority,
+        )
+        .await);
     }
 
     let inspect_req_meta = InspectMeta {
@@ -1234,6 +1396,8 @@ async fn proxy_http(
     *out_req.headers_mut() = parts.headers;
     strip_hop_headers(out_req.headers_mut());
     ensure_host_header(out_req.headers_mut(), &target.authority)?;
+    out_req =
+        maybe_apply_request_throttle(out_req, &state.throttle, &target.scheme, &target.authority);
 
     let upstream_resp = if state.transparent {
         transparent_upstream_request(out_req, &target).await?
@@ -1322,7 +1486,48 @@ async fn proxy_http(
         );
     }
 
-    Ok(out_resp)
+    Ok(
+        maybe_apply_response_throttle(out_resp, &state.throttle, &target.scheme, &target.authority)
+            .await,
+    )
+}
+
+fn maybe_apply_request_throttle(
+    mut req: hyper::Request<ProxyBody>,
+    throttle: &ThrottleConfig,
+    scheme: &str,
+    authority: &str,
+) -> hyper::Request<ProxyBody> {
+    if !throttle.is_active_for(scheme, authority) || throttle.upstream_bytes_per_sec == 0 {
+        return req;
+    }
+
+    let body = std::mem::replace(req.body_mut(), boxed_body(Full::new(Bytes::new())));
+    *req.body_mut() = maybe_throttle_body_with_rate(body, throttle.upstream_bytes_per_sec);
+    req
+}
+
+async fn maybe_apply_response_throttle(
+    mut resp: hyper::Response<ProxyBody>,
+    throttle: &ThrottleConfig,
+    scheme: &str,
+    authority: &str,
+) -> hyper::Response<ProxyBody> {
+    if !throttle.is_active_for(scheme, authority) {
+        return resp;
+    }
+
+    if throttle.latency_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(throttle.latency_ms)).await;
+    }
+
+    if throttle.downstream_bytes_per_sec == 0 {
+        return resp;
+    }
+
+    let body = std::mem::replace(resp.body_mut(), boxed_body(Full::new(Bytes::new())));
+    *resp.body_mut() = maybe_throttle_body(body, throttle);
+    resp
 }
 
 struct ResolvedTarget {
@@ -1773,6 +1978,35 @@ mod tests {
         assert_eq!(parse_env_u64(Some("0"), 42), 42);
         assert_eq!(parse_env_u64(Some("-1"), 42), 42);
         assert_eq!(parse_env_u64(Some("abc"), 42), 42);
+    }
+
+    #[test]
+    fn throttle_selected_hosts_match_subdomain_patterns() {
+        let cfg = ThrottleConfig {
+            enabled: true,
+            latency_ms: 120,
+            downstream_bytes_per_sec: 0,
+            upstream_bytes_per_sec: 0,
+            only_selected_hosts: true,
+            selected_hosts: vec![AllowRule::new("*.example.com")],
+        };
+
+        assert!(cfg.is_active_for("https", "api.example.com:443"));
+        assert!(!cfg.is_active_for("https", "example.net:443"));
+    }
+
+    #[test]
+    fn throttle_selected_hosts_disabled_uses_global_scope() {
+        let cfg = ThrottleConfig {
+            enabled: true,
+            latency_ms: 120,
+            downstream_bytes_per_sec: 0,
+            upstream_bytes_per_sec: 0,
+            only_selected_hosts: false,
+            selected_hosts: vec![],
+        };
+
+        assert!(cfg.is_active_for("https", "any-host.test:443"));
     }
 
     #[test]

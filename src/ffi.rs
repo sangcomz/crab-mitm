@@ -8,7 +8,7 @@ use http::StatusCode;
 use tokio::sync::watch;
 
 use crate::ca::{self, CaKeyAlgorithm, CertificateAuthority};
-use crate::proxy::{self, InspectConfig, TransparentConfig};
+use crate::proxy::{self, InspectConfig, ThrottleConfig, TransparentConfig};
 use crate::rules::{AllowRule, MapLocalRule, MapSource, Matcher, Rules, StatusRewriteRule};
 
 const CRAB_OK: i32 = 0;
@@ -24,6 +24,7 @@ pub struct CrabProxyHandle {
     ca: Mutex<Option<Arc<CertificateAuthority>>>,
     rules: Mutex<Rules>,
     inspect: Mutex<InspectConfig>,
+    throttle: Mutex<ThrottleConfig>,
     transparent: Mutex<TransparentConfig>,
     shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
     task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
@@ -518,6 +519,7 @@ pub extern "C" fn crab_proxy_create(
                 spool_dir: None,
                 spool_max_bytes: 100 * 1024 * 1024,
             }),
+            throttle: Mutex::new(ThrottleConfig::default()),
             transparent: Mutex::new(TransparentConfig::default()),
             shutdown_tx: Mutex::new(None),
             task: Mutex::new(None),
@@ -606,6 +608,106 @@ pub extern "C" fn crab_proxy_set_inspect_enabled(
         ffi_with_handle!(handle, h, {
             let mut guard = ffi_lock!(h.inspect, "inspect");
             guard.enabled = enabled;
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_set_throttle_enabled(
+    handle: *mut CrabProxyHandle,
+    enabled: bool,
+) -> CrabResult {
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.throttle, "throttle");
+            guard.enabled = enabled;
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_set_throttle_latency_ms(
+    handle: *mut CrabProxyHandle,
+    latency_ms: u64,
+) -> CrabResult {
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.throttle, "throttle");
+            guard.latency_ms = latency_ms;
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_set_throttle_downstream_bps(
+    handle: *mut CrabProxyHandle,
+    downstream_bps: u64,
+) -> CrabResult {
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.throttle, "throttle");
+            guard.downstream_bytes_per_sec = downstream_bps;
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_set_throttle_upstream_bps(
+    handle: *mut CrabProxyHandle,
+    upstream_bps: u64,
+) -> CrabResult {
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.throttle, "throttle");
+            guard.upstream_bytes_per_sec = upstream_bps;
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_set_throttle_only_selected_hosts(
+    handle: *mut CrabProxyHandle,
+    enabled: bool,
+) -> CrabResult {
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.throttle, "throttle");
+            guard.only_selected_hosts = enabled;
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_throttle_hosts_clear(handle: *mut CrabProxyHandle) -> CrabResult {
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.throttle, "throttle");
+            guard.selected_hosts.clear();
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_throttle_hosts_add(
+    handle: *mut CrabProxyHandle,
+    matcher: *const c_char,
+) -> CrabResult {
+    ffi_entry!({
+        ffi_with_handle!(handle, h, {
+            let matcher = ffi_try!(unsafe { require_cstr(matcher, "matcher") });
+            let matcher = matcher.trim();
+            if matcher.is_empty() {
+                return err_result(CRAB_ERR_INVALID_ARG, "matcher must not be empty");
+            }
+            let mut guard = ffi_lock!(h.throttle, "throttle");
+            guard.selected_hosts.push(AllowRule::new(matcher));
             ok_result()
         })
     })
@@ -788,6 +890,7 @@ pub extern "C" fn crab_proxy_start(handle: *mut CrabProxyHandle) -> CrabResult {
             let ca = ffi_lock!(h.ca, "ca").clone();
             let rules = Arc::new(ffi_lock!(h.rules, "rules").clone());
             let inspect = Arc::new(ffi_lock!(h.inspect, "inspect").clone());
+            let throttle = Arc::new(ffi_lock!(h.throttle, "throttle").clone());
             let transparent = ffi_lock!(h.transparent, "transparent").clone();
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -805,6 +908,7 @@ pub extern "C" fn crab_proxy_start(handle: *mut CrabProxyHandle) -> CrabResult {
                     ca,
                     rules,
                     inspect,
+                    throttle,
                     Some(transparent),
                     shutdown_rx,
                 )
