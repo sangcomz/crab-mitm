@@ -13,7 +13,7 @@ use super::response::{bytes_response, html_response, maybe_head_response, text_r
 
 const CERT_PORTAL_HOSTS: [&str; 3] = ["crab-proxy.local", "crab-proxy.invalid", "proxy.crab"];
 
-pub(super) fn maybe_handle_cert_portal(
+pub(super) async fn maybe_handle_cert_portal(
     method: &Method,
     target: &ResolvedTarget,
     ca: Option<&CertificateAuthority>,
@@ -54,13 +54,7 @@ pub(super) fn maybe_handle_cert_portal(
         }
         "/ca.pem" => {
             let Some(ca) = ca else {
-                return Some(maybe_head_response(
-                    method,
-                    text_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "CA is not loaded. Configure CA in the desktop app first.\n".to_string(),
-                    ),
-                ));
+                return Some(ca_unavailable_response(method));
             };
             let mut resp = bytes_response(
                 StatusCode::OK,
@@ -75,13 +69,7 @@ pub(super) fn maybe_handle_cert_portal(
         }
         "/android.crt" | "/ca.der" => {
             let Some(ca) = ca else {
-                return Some(maybe_head_response(
-                    method,
-                    text_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "CA is not loaded. Configure CA in the desktop app first.\n".to_string(),
-                    ),
-                ));
+                return Some(ca_unavailable_response(method));
             };
             let mut resp = bytes_response(
                 StatusCode::OK,
@@ -96,13 +84,7 @@ pub(super) fn maybe_handle_cert_portal(
         }
         "/ios.mobileconfig" => {
             let Some(ca) = ca else {
-                return Some(maybe_head_response(
-                    method,
-                    text_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "CA is not loaded. Configure CA in the desktop app first.\n".to_string(),
-                    ),
-                ));
+                return Some(ca_unavailable_response(method));
             };
             let mobileconfig = build_ios_mobileconfig(ca.ca_cert_der());
             let mut resp = bytes_response(
@@ -116,6 +98,32 @@ pub(super) fn maybe_handle_cert_portal(
             );
             Some(maybe_head_response(method, resp))
         }
+        "/ca.crl" => {
+            let Some(ca) = ca else {
+                return Some(ca_unavailable_response(method));
+            };
+            match ca.generate_crl_der().await {
+                Ok(crl_der) => {
+                    let mut resp = bytes_response(
+                        StatusCode::OK,
+                        "application/pkix-crl",
+                        Bytes::from(crl_der),
+                    );
+                    resp.headers_mut().insert(
+                        http::header::CONTENT_DISPOSITION,
+                        HeaderValue::from_static("attachment; filename=\"crab-proxy-ca.crl\""),
+                    );
+                    Some(maybe_head_response(method, resp))
+                }
+                Err(err) => Some(maybe_head_response(
+                    method,
+                    text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to generate CRL: {err}\n"),
+                    ),
+                )),
+            }
+        }
         _ => Some(maybe_head_response(
             method,
             text_response(
@@ -124,6 +132,16 @@ pub(super) fn maybe_handle_cert_portal(
             ),
         )),
     }
+}
+
+fn ca_unavailable_response(method: &Method) -> hyper::Response<super::ProxyBody> {
+    maybe_head_response(
+        method,
+        text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CA is not loaded. Configure CA in the desktop app first.\n".to_string(),
+        ),
+    )
 }
 
 pub(super) fn is_cert_portal_host(host: &str) -> bool {
@@ -141,6 +159,7 @@ pub(super) fn build_cert_portal_page(base_url: &str, fingerprint_sha256: Option<
   <p><b>Android:</b> download and install <a href="{base}/android.crt">android.crt</a></p>
   <p><b>iOS:</b> download and install <a href="{base}/ios.mobileconfig">ios.mobileconfig</a></p>
   <p><b>Raw PEM:</b> <a href="{base}/ca.pem">ca.pem</a></p>
+  <p><b>CRL:</b> <a href="{base}/ca.crl">ca.crl</a></p>
   <p class="fingerprint"><b>SHA-256 Fingerprint:</b><br /><code>{fingerprint}</code></p>
   <p class="note">iOS requires extra trust step:
   Settings &gt; General &gt; About &gt; Certificate Trust Settings.</p>

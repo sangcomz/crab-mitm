@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use http::StatusCode;
 use tokio::sync::watch;
 
-use crate::ca::{self, CertificateAuthority};
+use crate::ca::{self, CaKeyAlgorithm, CertificateAuthority};
 use crate::proxy::{self, InspectConfig, TransparentConfig};
 use crate::rules::{AllowRule, MapLocalRule, MapSource, Matcher, Rules, StatusRewriteRule};
 
@@ -380,7 +380,11 @@ fn emit_log_callback_line(cb: LogCallback, raw_line: &[u8]) {
     }
 
     if let Ok(c_msg) = CString::new(trimmed) {
-        (cb.func)(cb.user_data_ptr(), infer_level_bytes(trimmed), c_msg.as_ptr());
+        (cb.func)(
+            cb.user_data_ptr(),
+            infer_level_bytes(trimmed),
+            c_msg.as_ptr(),
+        );
         return;
     }
 
@@ -867,6 +871,41 @@ pub extern "C" fn crab_ca_generate(
         let out_key = PathBuf::from(ffi_try!(unsafe { require_cstr(out_key, "out_key") }));
 
         match ca::generate_ca_to_files(&common_name, days, &out_cert, &out_key) {
+            Ok(()) => ok_result(),
+            Err(err) => err_result(CRAB_ERR_CA, &format!("{err:#}")),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_ca_generate_with_algorithm(
+    common_name: *const c_char,
+    days: u32,
+    out_cert: *const c_char,
+    out_key: *const c_char,
+    key_algorithm: u32,
+) -> CrabResult {
+    ffi_entry!({
+        let common_name = ffi_try!(unsafe { require_cstr(common_name, "common_name") });
+        let out_cert = PathBuf::from(ffi_try!(unsafe { require_cstr(out_cert, "out_cert") }));
+        let out_key = PathBuf::from(ffi_try!(unsafe { require_cstr(out_key, "out_key") }));
+        let key_algorithm = match CaKeyAlgorithm::from_ffi(key_algorithm) {
+            Some(value) => value,
+            None => {
+                return err_result(
+                    CRAB_ERR_INVALID_ARG,
+                    "key_algorithm must be one of: 0 (ecdsa-p256), 1 (rsa-2048), 2 (rsa-4096)",
+                );
+            }
+        };
+
+        match ca::generate_ca_to_files_with_algorithm(
+            &common_name,
+            days,
+            &out_cert,
+            &out_key,
+            key_algorithm,
+        ) {
             Ok(()) => ok_result(),
             Err(err) => err_result(CRAB_ERR_CA, &format!("{err:#}")),
         }

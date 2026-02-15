@@ -64,6 +64,19 @@ CrabResult crab_proxy_stop(CrabProxyHandle *handle);
 bool crab_proxy_is_running(const CrabProxyHandle *handle);
 void crab_proxy_destroy(CrabProxyHandle *handle);
 
+enum {
+    CRAB_CA_KEY_ALGORITHM_ECDSA_P256 = 0,
+    CRAB_CA_KEY_ALGORITHM_RSA_2048 = 1,
+    CRAB_CA_KEY_ALGORITHM_RSA_4096 = 2
+};
+
 CrabResult crab_ca_generate(const char *common_name, uint32_t days, const char *out_cert, const char *out_key);
+CrabResult crab_ca_generate_with_algorithm(
+    const char *common_name,
+    uint32_t days,
+    const char *out_cert,
+    const char *out_key,
+    uint32_t key_algorithm
+);
 
 #endif

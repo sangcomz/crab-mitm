@@ -17,7 +17,7 @@ use pin_project::pin_project;
 use pin_project::pinned_drop;
 use serde_json::json;
 
-use super::{InspectConfig, ProxyBody, boxed_body};
+use super::{InspectConfig, ProxyBody, boxed_body, parse_env_bool};
 
 static NEXT_SPOOL_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -345,22 +345,10 @@ fn spawn_spool_writer(mut file: File) -> std::io::Result<SpoolWriter> {
 }
 
 fn should_mask_sensitive_headers() -> bool {
-    parse_env_bool_default_true(std::env::var("CRAB_MASK_SENSITIVE_HEADERS").ok().as_deref())
-}
-
-fn parse_env_bool_default_true(raw: Option<&str>) -> bool {
-    match raw.map(str::trim) {
-        None => true,
-        Some(value)
-            if value.eq_ignore_ascii_case("0")
-                || value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("off")
-                || value.eq_ignore_ascii_case("no") =>
-        {
-            false
-        }
-        Some(_) => true,
-    }
+    parse_env_bool(
+        std::env::var("CRAB_MASK_SENSITIVE_HEADERS").ok().as_deref(),
+        true,
+    )
 }
 
 fn is_sensitive_header(name: &str) -> bool {

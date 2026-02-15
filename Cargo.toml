@@ -31,7 +31,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "server", "server-a
 lru = "0.12"
 mime_guess = "2.0"
 pin-project = "1.1"
-rcgen = { version = "0.13", features = ["x509-parser"] }
+rcgen = { version = "0.13", features = ["x509-parser", "aws_lc_rs"] }
 rustls = "0.23"
 rustls-native-certs = "0.8"
 rustls-pemfile = "2.2"
@@ -45,3 +45,4 @@ tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+x509-parser = "0.16"

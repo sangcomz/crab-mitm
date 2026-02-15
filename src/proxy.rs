@@ -1,9 +1,12 @@
 use std::convert::Infallible;
 use std::error::Error as StdError;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -24,10 +27,12 @@ use hyper_util::server::conn::auto;
 use rustls::RootCertStore;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, copy_bidirectional};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::io::ReaderStream;
+use x509_parser::extensions::GeneralName;
+use x509_parser::parse_x509_certificate;
 
 use crate::ca::CertificateAuthority;
 use crate::rules::{MapSource, Rules};
@@ -69,6 +74,7 @@ struct ProxyState {
     rules: Arc<Rules>,
     ca: Option<Arc<CertificateAuthority>>,
     inspect: Arc<InspectConfig>,
+    plugin: Option<Arc<PluginRuntime>>,
     transparent: bool,
 }
 
@@ -76,6 +82,55 @@ struct ProxyState {
 struct RequestContext {
     default_scheme: &'static str,
     default_authority: Option<String>,
+}
+
+#[derive(Clone)]
+struct PluginRuntime {
+    hook_command: Arc<str>,
+    timeout: Duration,
+}
+
+impl PluginRuntime {
+    fn from_env() -> Option<Arc<Self>> {
+        let raw = std::env::var("CRAB_PLUGIN_HOOK").ok()?;
+        let command = raw.trim();
+        if command.is_empty() {
+            return None;
+        }
+        Some(Arc::new(Self {
+            hook_command: Arc::from(command.to_string()),
+            timeout: plugin_hook_timeout(),
+        }))
+    }
+
+    fn emit(&self, topic: &'static str, payload: serde_json::Value) {
+        let command = self.hook_command.clone();
+        let timeout = self.timeout;
+        let event_payload = json!({
+            "source": "crab-mitm",
+            "topic": topic,
+            "payload": payload,
+            "ts_unix_ms": unix_timestamp_ms(),
+        });
+        let payload_text = event_payload.to_string();
+        tokio::spawn(async move {
+            let join = tokio::task::spawn_blocking(move || {
+                run_plugin_hook_command(command.as_ref(), payload_text.as_bytes())
+            });
+            match tokio::time::timeout(timeout, join).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(err))) => {
+                    tracing::debug!(error = %err, "plugin hook failed");
+                }
+                Ok(Err(err)) => {
+                    tracing::debug!(error = %err, "plugin hook task join failed");
+                }
+                Err(_) => {
+                    tracing::debug!("plugin hook timed out");
+                }
+            }
+        });
+    }
 }
 
 pub async fn run(
@@ -118,12 +173,35 @@ pub async fn run_with_shutdown(
         _ => None,
     };
 
+    let plugin = PluginRuntime::from_env();
+    if let Some(runtime) = plugin.as_ref() {
+        tracing::info!(
+            hook = %runtime.hook_command,
+            timeout_ms = runtime.timeout.as_millis() as u64,
+            "plugin hook enabled"
+        );
+    }
+
+    if http3_observer_enabled() {
+        let mut observer_shutdown = shutdown_rx.clone();
+        let listen_addr = listen.to_string();
+        let plugin_runtime = plugin.clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                run_http3_udp_observer(&listen_addr, plugin_runtime, &mut observer_shutdown).await
+            {
+                tracing::warn!(error = %err, listen = %listen_addr, "HTTP/3 observer stopped");
+            }
+        });
+    }
+
     let client = build_client()?;
     let forward_state = ProxyState {
         client: client.clone(),
         rules: rules.clone(),
         ca: ca.clone(),
         inspect: inspect.clone(),
+        plugin: plugin.clone(),
         transparent: false,
     };
     let transparent_state = ProxyState {
@@ -131,6 +209,7 @@ pub async fn run_with_shutdown(
         rules,
         ca,
         inspect,
+        plugin,
         transparent: true,
     };
 
@@ -227,11 +306,10 @@ async fn transparent_upstream_request(
         .uri
         .host()
         .context("missing host in URI for transparent upstream")?;
-    let port = target.uri.port_u16().unwrap_or(if target.scheme == "https" {
-        443
-    } else {
-        80
-    });
+    let port = target
+        .uri
+        .port_u16()
+        .unwrap_or(if target.scheme == "https" { 443 } else { 80 });
 
     let addr = transparent::resolve_host(host, port).await?;
     let tcp_stream = transparent::connect_transparent(addr).await?;
@@ -303,10 +381,48 @@ async fn handle_request(
         return handle_connect(req, peer, state);
     }
 
-    match proxy_http(req, peer, state, ctx).await {
+    let request_started_at = Instant::now();
+    let request_id: Arc<str> =
+        Arc::from(NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string());
+    let method_for_error = req.method().clone();
+    let url_for_error = request_url_for_log(req.uri(), req.headers(), &ctx);
+    let plugin = state.plugin.clone();
+
+    match proxy_http(
+        req,
+        peer,
+        state,
+        ctx,
+        request_id.clone(),
+        request_started_at,
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err(err) => {
-            tracing::warn!(peer = %peer, error = %err, "request failed");
+            tracing::warn!(
+                request_id = %request_id,
+                peer = %peer,
+                method = %method_for_error,
+                url = %url_for_error,
+                status = %StatusCode::BAD_GATEWAY,
+                error = %err,
+                "request failed"
+            );
+            emit_entry_log(
+                plugin.as_ref(),
+                json!({
+                    "type": "entry",
+                    "event": "upstream_error",
+                    "request_id": request_id.as_ref(),
+                    "peer": peer.to_string(),
+                    "method": method_for_error.as_str(),
+                    "url": url_for_error,
+                    "status": StatusCode::BAD_GATEWAY.as_u16(),
+                    "duration_ms": elapsed_millis(request_started_at),
+                    "error": err.to_string()
+                }),
+            );
             text_response(StatusCode::BAD_GATEWAY, "bad gateway\n".to_string())
         }
     }
@@ -348,6 +464,7 @@ fn handle_connect(
     let rules = state.rules.clone();
     let client = state.client.clone();
     let inspect = state.inspect.clone();
+    let plugin = state.plugin.clone();
     let mitm_allowed = rules.is_mitm_allowed("https", &authority_str);
     let should_mitm = ca.is_some() && mitm_allowed;
 
@@ -360,16 +477,19 @@ fn handle_connect(
             encrypted = true,
             "tunnel"
         );
-        emit_structured_log(json!({
-            "type": "entry",
-            "event": "tunnel",
-            "request_id": request_id,
-            "peer": peer.to_string(),
-            "method": "CONNECT",
-            "url": target_url,
-            "status": 200,
-            "encrypted": true
-        }));
+        emit_entry_log(
+            plugin.as_ref(),
+            json!({
+                "type": "entry",
+                "event": "tunnel",
+                "request_id": request_id,
+                "peer": peer.to_string(),
+                "method": "CONNECT",
+                "url": target_url,
+                "status": 200,
+                "encrypted": true
+            }),
+        );
     }
 
     tokio::spawn(async move {
@@ -383,10 +503,12 @@ fn handle_connect(
                         peer,
                         &authority_str,
                         &host,
+                        port,
                         ca,
                         rules,
                         client,
                         inspect,
+                        plugin,
                     )
                     .await
                     {
@@ -532,12 +654,22 @@ fn is_connect_target_blocked(host: &str, port: u16) -> bool {
 }
 
 fn connect_private_block_enabled() -> bool {
-    parse_env_bool(std::env::var("CRAB_CONNECT_BLOCK_PRIVATE").ok().as_deref(), true)
+    parse_env_bool(
+        std::env::var("CRAB_CONNECT_BLOCK_PRIVATE").ok().as_deref(),
+        true,
+    )
 }
 
-fn parse_env_bool(raw: Option<&str>, default: bool) -> bool {
+fn upstream_san_sniff_enabled() -> bool {
+    parse_env_bool(
+        std::env::var("CRAB_SNIFF_UPSTREAM_CERT").ok().as_deref(),
+        false,
+    )
+}
+
+pub(super) fn parse_env_bool(raw: Option<&str>, default_value: bool) -> bool {
     match raw.map(str::trim) {
-        None => default,
+        None => default_value,
         Some(value)
             if value.eq_ignore_ascii_case("0")
                 || value.eq_ignore_ascii_case("false")
@@ -548,6 +680,127 @@ fn parse_env_bool(raw: Option<&str>, default: bool) -> bool {
         }
         Some(_) => true,
     }
+}
+
+fn parse_env_u64(raw: Option<&str>, default_value: u64) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_value)
+}
+
+fn plugin_hook_timeout() -> Duration {
+    let ms = parse_env_u64(
+        std::env::var("CRAB_PLUGIN_HOOK_TIMEOUT_MS").ok().as_deref(),
+        1_500,
+    );
+    Duration::from_millis(ms)
+}
+
+fn unix_timestamp_ms() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(u128::from(u64::MAX)) as u64,
+        Err(_) => 0,
+    }
+}
+
+fn run_plugin_hook_command(command: &str, payload: &[u8]) -> Result<()> {
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-lc")
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn plugin hook command: {command}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(payload)
+            .context("failed to write plugin payload")?;
+    }
+
+    let status = child.wait().context("failed to wait for plugin hook")?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("plugin hook exited with status {status}");
+    }
+}
+
+fn emit_entry_log(plugin: Option<&Arc<PluginRuntime>>, payload: serde_json::Value) {
+    emit_structured_log(payload.clone());
+    if let Some(plugin) = plugin {
+        plugin.emit("entry", payload);
+    }
+}
+
+fn http3_observer_enabled() -> bool {
+    parse_env_bool(std::env::var("CRAB_HTTP3_OBSERVE").ok().as_deref(), false)
+}
+
+async fn run_http3_udp_observer(
+    listen: &str,
+    plugin: Option<Arc<PluginRuntime>>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let socket = UdpSocket::bind(listen)
+        .await
+        .with_context(|| format!("failed to bind HTTP/3 observer UDP socket: {listen}"))?;
+    tracing::info!(listen = %listen, "HTTP/3 observer listening (UDP)");
+
+    let mut buffer = vec![0u8; 2048];
+    loop {
+        tokio::select! {
+            recv = socket.recv_from(&mut buffer) => {
+                let (len, peer) = recv.context("HTTP/3 observer recv failed")?;
+                if len == 0 {
+                    continue;
+                }
+                if let Some(version) = quic_initial_version(&buffer[..len]) {
+                    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string();
+                    let payload = json!({
+                        "type": "entry",
+                        "event": "http3_quic_observed",
+                        "request_id": request_id,
+                        "peer": peer.to_string(),
+                        "method": "QUIC",
+                        "url": format!("quic://{peer}/"),
+                        "udp_bytes": len as u64,
+                        "quic_version": format!("0x{version:08x}")
+                    });
+                    emit_entry_log(plugin.as_ref(), payload);
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    tracing::info!("HTTP/3 observer shutdown signal received");
+                } else {
+                    tracing::info!("HTTP/3 observer shutdown channel closed");
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn quic_initial_version(packet: &[u8]) -> Option<u32> {
+    if packet.len() < 5 {
+        return None;
+    }
+
+    let first = packet[0];
+    if first & 0x80 == 0 || first & 0x40 == 0 {
+        return None;
+    }
+
+    let packet_type = (first & 0x30) >> 4;
+    if packet_type != 0 {
+        return None;
+    }
+
+    let version: [u8; 4] = packet[1..5].try_into().ok()?;
+    Some(u32::from_be_bytes(version))
 }
 
 fn is_blocked_connect_host_literal(host: &str) -> bool {
@@ -587,13 +840,20 @@ async fn mitm_https(
     peer: SocketAddr,
     authority: &str,
     host_for_cert: &str,
+    port_for_cert: u16,
     ca: Arc<CertificateAuthority>,
     rules: Arc<Rules>,
     client: HttpClient,
     inspect: Arc<InspectConfig>,
+    plugin: Option<Arc<PluginRuntime>>,
 ) -> Result<()> {
+    let upstream_sans = if upstream_san_sniff_enabled() {
+        sniff_upstream_subject_names(host_for_cert, port_for_cert).await
+    } else {
+        None
+    };
     let tls_cfg = ca
-        .server_config_for_host(host_for_cert)
+        .server_config_for_host(host_for_cert, upstream_sans)
         .await
         .with_context(|| format!("failed to build cert for {host_for_cert}"))?;
     let acceptor = TlsAcceptor::from(tls_cfg);
@@ -612,6 +872,7 @@ async fn mitm_https(
         rules,
         ca: Some(ca),
         inspect,
+        plugin,
         transparent: false,
     };
 
@@ -634,11 +895,176 @@ async fn mitm_https(
     Ok(())
 }
 
+async fn sniff_upstream_subject_names(host: &str, port: u16) -> Option<Vec<String>> {
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+    const TLS_TIMEOUT: Duration = Duration::from_secs(3);
+
+    let upstream_addr = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        transparent::resolve_host(host, port),
+    )
+    .await
+    {
+        Ok(Ok(addr)) => addr,
+        Ok(Err(err)) => {
+            tracing::debug!(host = %host, port, error = %err, "upstream SAN sniff DNS lookup failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(host = %host, port, "upstream SAN sniff DNS lookup timed out");
+            return None;
+        }
+    };
+
+    let upstream_tcp = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        transparent::connect_transparent(upstream_addr),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            tracing::debug!(host = %host, port, error = %err, "upstream SAN sniff connect failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(host = %host, port, "upstream SAN sniff connect timed out");
+            return None;
+        }
+    };
+
+    let tls_config = match transparent::build_upstream_tls_config() {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::debug!(host = %host, port, error = %err, "upstream SAN sniff TLS config failed");
+            return None;
+        }
+    };
+    let connector = tokio_rustls::TlsConnector::from(tls_config);
+    let server_name = match rustls::pki_types::ServerName::try_from(host.to_string()) {
+        Ok(name) => name,
+        Err(_) => {
+            tracing::debug!(host = %host, port, "upstream SAN sniff invalid SNI host");
+            return None;
+        }
+    };
+
+    let tls_stream = match tokio::time::timeout(
+        TLS_TIMEOUT,
+        connector.connect(server_name, upstream_tcp),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            tracing::debug!(host = %host, port, error = %err, "upstream SAN sniff TLS handshake failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(host = %host, port, "upstream SAN sniff TLS handshake timed out");
+            return None;
+        }
+    };
+
+    let peer_certs = match tls_stream.get_ref().1.peer_certificates() {
+        Some(certs) if !certs.is_empty() => certs,
+        _ => {
+            tracing::debug!(host = %host, port, "upstream SAN sniff found no peer certificate");
+            return None;
+        }
+    };
+
+    let subject_names = parse_subject_names_from_leaf_cert(peer_certs[0].as_ref());
+    if subject_names.is_empty() {
+        tracing::debug!(host = %host, port, "upstream SAN sniff found no SAN/CN values");
+        None
+    } else {
+        tracing::debug!(host = %host, port, count = subject_names.len(), "upstream SAN sniff succeeded");
+        Some(subject_names)
+    }
+}
+
+fn parse_subject_names_from_leaf_cert(leaf_cert_der: &[u8]) -> Vec<String> {
+    let (_, cert) = match parse_x509_certificate(leaf_cert_der) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::debug!(error = ?err, "failed to parse upstream leaf certificate");
+            return Vec::new();
+        }
+    };
+
+    let mut names: Vec<String> = Vec::new();
+
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for general_name in &san.value.general_names {
+            if let Some(name) = general_name_to_subject_name(general_name) {
+                push_unique_name(&mut names, name);
+            }
+        }
+    }
+
+    if names.is_empty() {
+        for common_name in cert.subject().iter_common_name() {
+            if let Ok(cn) = common_name.as_str()
+                && let Some(name) = normalize_subject_name(cn)
+            {
+                push_unique_name(&mut names, name);
+            }
+        }
+    }
+
+    names
+}
+
+fn general_name_to_subject_name(name: &GeneralName<'_>) -> Option<String> {
+    match name {
+        GeneralName::DNSName(value) => normalize_subject_name(value),
+        GeneralName::IPAddress(raw) => match raw.len() {
+            4 => {
+                let bytes: [u8; 4] = (*raw).try_into().ok()?;
+                Some(Ipv4Addr::from(bytes).to_string())
+            }
+            16 => {
+                let bytes: [u8; 16] = (*raw).try_into().ok()?;
+                Some(Ipv6Addr::from(bytes).to_string())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn normalize_subject_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+
+    let normalized = trimmed.trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn push_unique_name(names: &mut Vec<String>, candidate: String) {
+    if !names.iter().any(|name| name == &candidate) {
+        names.push(candidate);
+    }
+}
+
 async fn proxy_http(
     req: hyper::Request<Incoming>,
     peer: SocketAddr,
     state: ProxyState,
     ctx: RequestContext,
+    request_id: Arc<str>,
+    request_started_at: Instant,
 ) -> Result<hyper::Response<ProxyBody>> {
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
@@ -654,7 +1080,6 @@ async fn proxy_http(
         target.scheme, target.authority, path_and_query
     ));
     let method_for_inspect: Arc<str> = Arc::from(method.as_str());
-    let request_id: Arc<str> = Arc::from(NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string());
 
     tracing::debug!(
         peer = %peer,
@@ -663,7 +1088,8 @@ async fn proxy_http(
         "request"
     );
 
-    if let Some(resp) = maybe_handle_cert_portal(&method, &target, state.ca.as_deref()) {
+    if let Some(resp) = maybe_handle_cert_portal(&method, &target, state.ca.as_deref()).await {
+        let response_size_bytes = response_size_from_headers(resp.headers());
         tracing::info!(
             peer = %peer,
             method = %method,
@@ -671,15 +1097,20 @@ async fn proxy_http(
             status = %resp.status(),
             "cert_portal"
         );
-        emit_structured_log(json!({
-            "type": "entry",
-            "event": "cert_portal",
-            "request_id": request_id.as_ref(),
-            "peer": peer.to_string(),
-            "method": method.as_str(),
-            "url": request_url.as_ref(),
-            "status": resp.status().as_u16()
-        }));
+        emit_entry_log(
+            state.plugin.as_ref(),
+            json!({
+                "type": "entry",
+                "event": "cert_portal",
+                "request_id": request_id.as_ref(),
+                "peer": peer.to_string(),
+                "method": method.as_str(),
+                "url": request_url.as_ref(),
+                "status": resp.status().as_u16(),
+                "duration_ms": elapsed_millis(request_started_at),
+                "response_size_bytes": response_size_bytes
+            }),
+        );
         return Ok(resp);
     }
 
@@ -763,16 +1194,22 @@ async fn proxy_http(
             map_local = %rule.matcher.raw(),
             "map_local"
         );
-        emit_structured_log(json!({
-            "type": "entry",
-            "event": "map_local",
-            "request_id": request_id.as_ref(),
-            "peer": peer.to_string(),
-            "method": method.as_str(),
-            "url": request_url.as_ref(),
-            "status": resp.status().as_u16(),
-            "map_local": rule.matcher.raw()
-        }));
+        let response_size_bytes = response_size_from_headers(resp.headers());
+        emit_entry_log(
+            state.plugin.as_ref(),
+            json!({
+                "type": "entry",
+                "event": "map_local",
+                "request_id": request_id.as_ref(),
+                "peer": peer.to_string(),
+                "method": method.as_str(),
+                "url": request_url.as_ref(),
+                "status": resp.status().as_u16(),
+                "map_local": rule.matcher.raw(),
+                "duration_ms": elapsed_millis(request_started_at),
+                "response_size_bytes": response_size_bytes
+            }),
+        );
         return Ok(resp);
     }
 
@@ -868,15 +1305,21 @@ async fn proxy_http(
             status = %out_resp.status(),
             "upstream"
         );
-        emit_structured_log(json!({
-            "type": "entry",
-            "event": "upstream",
-            "request_id": request_id.as_ref(),
-            "peer": peer.to_string(),
-            "method": method.as_str(),
-            "url": request_url.as_ref(),
-            "status": out_resp.status().as_u16()
-        }));
+        let response_size_bytes = response_size_from_headers(out_resp.headers());
+        emit_entry_log(
+            state.plugin.as_ref(),
+            json!({
+                "type": "entry",
+                "event": "upstream",
+                "request_id": request_id.as_ref(),
+                "peer": peer.to_string(),
+                "method": method.as_str(),
+                "url": request_url.as_ref(),
+                "status": out_resp.status().as_u16(),
+                "duration_ms": elapsed_millis(request_started_at),
+                "response_size_bytes": response_size_bytes
+            }),
+        );
     }
 
     Ok(out_resp)
@@ -922,6 +1365,18 @@ fn resolve_target(uri: &Uri, headers: &HeaderMap, ctx: &RequestContext) -> Resul
         authority,
         uri: full,
     })
+}
+
+fn request_url_for_log(uri: &Uri, headers: &HeaderMap, ctx: &RequestContext) -> String {
+    if let Ok(target) = resolve_target(uri, headers, ctx) {
+        let path_and_query = target
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        return format!("{}://{}{}", target.scheme, target.authority, path_and_query);
+    }
+    uri.to_string()
 }
 
 async fn map_local_response(
@@ -1111,6 +1566,17 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
     }
 }
 
+fn elapsed_millis(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn response_size_from_headers(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 fn emit_structured_log(payload: serde_json::Value) {
     tracing::info!("CRAB_JSON {}", payload);
 }
@@ -1201,6 +1667,7 @@ mod tests {
         assert!(html.contains("/android.crt"));
         assert!(html.contains("/ios.mobileconfig"));
         assert!(html.contains("/ca.pem"));
+        assert!(html.contains("/ca.crl"));
         assert!(html.contains("SHA-256 Fingerprint"));
         assert!(html.contains("AA:BB:CC:DD:EE:FF"));
     }
@@ -1287,21 +1754,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_bool_supports_various_inputs() {
-        // Default false
-        assert!(!parse_env_bool(None, false));
-        assert!(!parse_env_bool(Some("false"), false));
-        assert!(!parse_env_bool(Some("0"), false));
-        assert!(!parse_env_bool(Some("off"), false));
-        assert!(!parse_env_bool(Some("no"), false));
-        assert!(parse_env_bool(Some("true"), false));
-        
-        // Default true
+    fn parse_env_bool_supports_defaults_and_false_values() {
         assert!(parse_env_bool(None, true));
+        assert!(!parse_env_bool(None, false));
         assert!(!parse_env_bool(Some("false"), true));
         assert!(!parse_env_bool(Some("0"), true));
         assert!(!parse_env_bool(Some("off"), true));
         assert!(!parse_env_bool(Some("no"), true));
         assert!(parse_env_bool(Some("true"), true));
+        assert!(parse_env_bool(Some("true"), false));
+    }
+
+    #[test]
+    fn parse_env_u64_supports_defaults_and_positive_numbers() {
+        assert_eq!(parse_env_u64(None, 42), 42);
+        assert_eq!(parse_env_u64(Some("1200"), 42), 1200);
+        assert_eq!(parse_env_u64(Some(" 77 "), 42), 77);
+        assert_eq!(parse_env_u64(Some("0"), 42), 42);
+        assert_eq!(parse_env_u64(Some("-1"), 42), 42);
+        assert_eq!(parse_env_u64(Some("abc"), 42), 42);
+    }
+
+    #[test]
+    fn quic_initial_version_detects_initial_packets() {
+        let packet = [0xC0u8, 0x00, 0x00, 0x00, 0x01];
+        assert_eq!(quic_initial_version(&packet), Some(1));
+    }
+
+    #[test]
+    fn quic_initial_version_ignores_non_initial_or_short_packets() {
+        assert_eq!(quic_initial_version(&[]), None);
+        assert_eq!(quic_initial_version(&[0x40, 0, 0, 0, 1]), None);
+        assert_eq!(quic_initial_version(&[0xD0, 0, 0, 0, 1]), None);
     }
 }

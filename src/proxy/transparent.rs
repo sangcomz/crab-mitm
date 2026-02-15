@@ -1,12 +1,12 @@
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use tokio::net::{TcpSocket, TcpStream};
-use tokio_rustls::server::TlsStream;
 use tokio_rustls::LazyConfigAcceptor;
+use tokio_rustls::server::TlsStream;
 
 const EXCLUDE_PORT_START: u16 = 50000;
 const EXCLUDE_PORT_END: u16 = 50099;
@@ -57,7 +57,7 @@ pub async fn accept_tls_with_sni(
         .to_string();
 
     let tls_cfg = ca
-        .server_config_for_host(&hostname)
+        .server_config_for_host(&hostname, None)
         .await
         .with_context(|| format!("failed to build cert for {hostname}"))?;
 
@@ -141,8 +141,19 @@ pub async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
 pub fn build_upstream_tls_config() -> Result<Arc<rustls::ClientConfig>> {
     let roots = rustls_native_certs::load_native_certs();
     let mut root_store = rustls::RootCertStore::empty();
+    let mut loaded_roots = 0usize;
     for cert in roots.certs {
-        let _ = root_store.add(cert);
+        match root_store.add(cert) {
+            Ok(_) => {
+                loaded_roots += 1;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "skipping invalid native root certificate");
+            }
+        }
+    }
+    if loaded_roots == 0 {
+        tracing::error!("no valid root certificates loaded — upstream TLS will fail");
     }
 
     let config = rustls::ClientConfig::builder()
