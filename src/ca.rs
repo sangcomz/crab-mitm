@@ -176,7 +176,6 @@ impl CertificateAuthority {
         leaf_params.is_ca = rcgen::IsCa::NoCa;
         leaf_params.key_usages = vec![
             rcgen::KeyUsagePurpose::DigitalSignature,
-            rcgen::KeyUsagePurpose::KeyEncipherment,
         ];
         leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
 
