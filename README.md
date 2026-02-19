@@ -14,6 +14,7 @@ It supports standalone CLI usage and embedding via C FFI (`include/crab_mitm.h`)
 - Rule engine:
   - Allowlist (controls HTTPS MITM targets).
   - `map_local` (replace response with local file/text).
+  - `map_remote` (rewrite upstream destination by URL prefix, via FFI).
   - `status_rewrite` (rewrite upstream status code).
 - Streaming upstream request/response forwarding.
 - Body inspection (sample logging + optional file spool).
@@ -173,7 +174,7 @@ Common calls:
 
 - `crab_proxy_create`, `crab_proxy_start`, `crab_proxy_stop`, `crab_proxy_destroy`
 - `crab_proxy_load_ca`, `crab_ca_generate`, `crab_ca_generate_with_algorithm`
-- `crab_proxy_rules_add_allow`, `crab_proxy_rules_add_map_local_file`, `crab_proxy_rules_add_status_rewrite`
+- `crab_proxy_rules_add_allow`, `crab_proxy_rules_add_map_local_file`, `crab_proxy_rules_add_map_remote`, `crab_proxy_rules_add_status_rewrite`
 - `crab_proxy_set_throttle_*`, `crab_proxy_set_client_allowlist_enabled`
 - `crab_proxy_set_transparent_enabled`, `crab_proxy_set_transparent_port`
 

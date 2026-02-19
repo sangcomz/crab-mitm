@@ -17,6 +17,12 @@ pub struct MapLocalRule {
 }
 
 #[derive(Clone, Debug)]
+pub struct MapRemoteRule {
+    pub matcher: Matcher,
+    pub destination: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct StatusRewriteRule {
     pub matcher: Matcher,
     pub from: Option<StatusCode>,
@@ -27,6 +33,7 @@ pub struct StatusRewriteRule {
 pub struct Rules {
     pub allowlist: Vec<AllowRule>,
     pub map_local: Vec<MapLocalRule>,
+    pub map_remote: Vec<MapRemoteRule>,
     pub status_rewrite: Vec<StatusRewriteRule>,
 }
 
@@ -293,6 +300,17 @@ impl Rules {
             .find(|rule| rule.matcher.is_match(scheme, authority, path_and_query))
     }
 
+    pub fn find_map_remote(
+        &self,
+        scheme: &str,
+        authority: &str,
+        path_and_query: &str,
+    ) -> Option<&MapRemoteRule> {
+        self.map_remote
+            .iter()
+            .find(|rule| rule.matcher.is_match(scheme, authority, path_and_query))
+    }
+
     pub fn rewrite_status(
         &self,
         scheme: &str,
@@ -345,6 +363,7 @@ mod tests {
         let rules = Rules {
             allowlist: vec![],
             map_local: vec![],
+            map_remote: vec![],
             status_rewrite: vec![
                 StatusRewriteRule {
                     matcher: Matcher::new("/api"),
@@ -410,5 +429,25 @@ mod tests {
     fn rules_default_disallows_mitm_without_allowlist() {
         let rules = Rules::default();
         assert!(!rules.is_mitm_allowed("https", "example.com:443"));
+    }
+
+    #[test]
+    fn find_map_remote_supports_prefix_match() {
+        let rules = Rules {
+            allowlist: vec![],
+            map_local: vec![],
+            map_remote: vec![MapRemoteRule {
+                matcher: Matcher::new("api.example.com/v1"),
+                destination: "https://staging.example.com/v2".to_string(),
+            }],
+            status_rewrite: vec![],
+        };
+
+        let found = rules.find_map_remote("https", "api.example.com", "/v1/users");
+        assert!(found.is_some());
+        assert_eq!(
+            found.map(|rule| rule.destination.as_str()),
+            Some("https://staging.example.com/v2")
+        );
     }
 }

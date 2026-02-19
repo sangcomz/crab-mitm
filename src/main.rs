@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
 
             if ca.is_none() {
                 tracing::warn!(
-                    "no CA provided; HTTPS will be tunneled (no MITM), so map_local/status_rewrite won't apply to HTTPS"
+                    "no CA provided; HTTPS will be tunneled (no MITM), so map_local/map_remote/status_rewrite won't apply to HTTPS"
                 );
             }
 

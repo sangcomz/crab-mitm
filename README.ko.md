@@ -12,6 +12,7 @@ CLI로 단독 실행할 수 있고, C FFI(`include/crab_mitm.h`)로 임베드할
 - 규칙 엔진:
   - Allowlist(HTTPS MITM 대상 제어)
   - `map_local`(로컬 파일/텍스트로 응답 대체)
+  - `map_remote`(URL prefix 기준 업스트림 대상 리맵, FFI 경유)
   - `status_rewrite`(응답 status code 변경)
 - 업스트림 request/response 스트리밍 전달
 - 바디 인스펙션(샘플 로그 + 선택적 파일 스풀)
@@ -172,7 +173,7 @@ CLI 규칙 인자는 config-file 규칙보다 먼저 적용됩니다.
 
 - `crab_proxy_create`, `crab_proxy_start`, `crab_proxy_stop`, `crab_proxy_destroy`
 - `crab_proxy_load_ca`, `crab_ca_generate`, `crab_ca_generate_with_algorithm`
-- `crab_proxy_rules_add_allow`, `crab_proxy_rules_add_map_local_file`, `crab_proxy_rules_add_status_rewrite`
+- `crab_proxy_rules_add_allow`, `crab_proxy_rules_add_map_local_file`, `crab_proxy_rules_add_map_remote`, `crab_proxy_rules_add_status_rewrite`
 - `crab_proxy_set_throttle_*`, `crab_proxy_set_client_allowlist_enabled`
 - `crab_proxy_set_transparent_enabled`, `crab_proxy_set_transparent_port`
 

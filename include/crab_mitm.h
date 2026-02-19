@@ -63,6 +63,11 @@ CrabResult crab_proxy_rules_add_map_local_text(
     uint16_t status_code,
     const char *content_type /* nullable */
 );
+CrabResult crab_proxy_rules_add_map_remote(
+    CrabProxyHandle *handle,
+    const char *matcher,
+    const char *destination
+);
 CrabResult crab_proxy_rules_add_status_rewrite(
     CrabProxyHandle *handle,
     const char *matcher,

@@ -4,12 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
-use http::StatusCode;
+use http::{StatusCode, Uri};
 use tokio::sync::watch;
 
 use crate::ca::{self, CaKeyAlgorithm, CertificateAuthority};
 use crate::proxy::{self, ClientAccessConfig, InspectConfig, ThrottleConfig, TransparentConfig};
-use crate::rules::{AllowRule, MapLocalRule, MapSource, Matcher, Rules, StatusRewriteRule};
+use crate::rules::{AllowRule, MapLocalRule, MapRemoteRule, MapSource, Matcher, Rules, StatusRewriteRule};
 
 const CRAB_OK: i32 = 0;
 const CRAB_ERR_INVALID_ARG: i32 = 1;
@@ -169,6 +169,44 @@ fn parse_status_code(raw: u16, arg_name: &str) -> Result<StatusCode, CrabResult>
             &format!("{arg_name} must be a valid HTTP status code"),
         )
     })
+}
+
+fn validate_map_remote_destination(raw_destination: &str) -> Result<String, CrabResult> {
+    let destination = raw_destination.trim();
+    if destination.is_empty() {
+        return Err(err_result(
+            CRAB_ERR_INVALID_ARG,
+            "destination must not be empty",
+        ));
+    }
+
+    let uri = destination.parse::<Uri>().map_err(|_| {
+        err_result(
+            CRAB_ERR_INVALID_ARG,
+            "destination must be a valid absolute URL",
+        )
+    })?;
+
+    let scheme = uri.scheme_str().ok_or_else(|| {
+        err_result(
+            CRAB_ERR_INVALID_ARG,
+            "destination must include scheme (http or https)",
+        )
+    })?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(err_result(
+            CRAB_ERR_INVALID_ARG,
+            "destination scheme must be http or https",
+        ));
+    }
+    if uri.authority().is_none() {
+        return Err(err_result(
+            CRAB_ERR_INVALID_ARG,
+            "destination must include host",
+        ));
+    }
+
+    Ok(destination.to_string())
 }
 
 fn map_local_allowed_roots() -> &'static [PathBuf] {
@@ -810,6 +848,7 @@ pub extern "C" fn crab_proxy_rules_clear(handle: *mut CrabProxyHandle) -> CrabRe
             let mut guard = ffi_lock!(h.rules, "rules");
             guard.allowlist.clear();
             guard.map_local.clear();
+            guard.map_remote.clear();
             guard.status_rewrite.clear();
             ok_result()
         })
@@ -885,6 +924,34 @@ pub extern "C" fn crab_proxy_rules_add_map_local_text(
                 source: MapSource::Text(text),
                 status,
                 content_type,
+            });
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_rules_add_map_remote(
+    handle: *mut CrabProxyHandle,
+    matcher: *const c_char,
+    destination: *const c_char,
+) -> CrabResult {
+    ffi_entry!({
+        ffi_with_stopped_handle!(handle, h, {
+            let matcher = ffi_try!(unsafe { require_cstr(matcher, "matcher") });
+            let destination = ffi_try!(unsafe { require_cstr(destination, "destination") });
+
+            let matcher = matcher.trim();
+            if matcher.is_empty() {
+                return err_result(CRAB_ERR_INVALID_ARG, "matcher must not be empty");
+            }
+
+            let destination = ffi_try!(validate_map_remote_destination(&destination));
+
+            let mut guard = ffi_lock!(h.rules, "rules");
+            guard.map_remote.push(MapRemoteRule {
+                matcher: Matcher::new(matcher),
+                destination,
             });
             ok_result()
         })
@@ -1258,6 +1325,20 @@ mod tests {
         assert!(message.contains("running"));
 
         assert_ok(crab_proxy_stop(handle.raw()));
+    }
+
+    #[test]
+    fn ffi_map_remote_requires_absolute_destination() {
+        let handle = create_handle(None);
+        let matcher = CString::new("example.com/api").expect("matcher cstring");
+        let destination = CString::new("/internal/mock").expect("destination cstring");
+        let (code, message) = crab_result_to_owned(crab_proxy_rules_add_map_remote(
+            handle.raw(),
+            matcher.as_ptr(),
+            destination.as_ptr(),
+        ));
+        assert_eq!(code, CRAB_ERR_INVALID_ARG);
+        assert!(!message.is_empty());
     }
 
     #[test]

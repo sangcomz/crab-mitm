@@ -1319,6 +1319,8 @@ async fn proxy_http(
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let target = resolve_target(&parts.uri, &parts.headers, &ctx)?;
+    let mut upstream_target = target.clone();
+    let mut map_remote_applied: Option<(String, String)> = None;
 
     {
         let auth: http::uri::Authority = target
@@ -1491,6 +1493,17 @@ async fn proxy_http(
         .await);
     }
 
+    if allowed
+        && let Some(rule) =
+            state
+                .rules
+                .find_map_remote(&target.scheme, &target.authority, path_and_query)
+    {
+        upstream_target = rewrite_map_remote_target(&target, path_and_query, rule)?;
+        let upstream_url = resolved_target_url(&upstream_target);
+        map_remote_applied = Some((rule.matcher.raw().to_string(), upstream_url));
+    }
+
     let inspect_req_meta = InspectMeta {
         request_id: request_id.clone(),
         direction: "request",
@@ -1507,17 +1520,19 @@ async fn proxy_http(
 
     let mut out_req = hyper::Request::new(req_body);
     *out_req.method_mut() = parts.method;
-    *out_req.uri_mut() = target.uri.clone();
+    *out_req.uri_mut() = upstream_target.uri.clone();
     *out_req.version_mut() = parts.version;
     *out_req.headers_mut() = parts.headers;
     strip_hop_headers(out_req.headers_mut());
-    ensure_host_header(out_req.headers_mut(), &target.authority)?;
+    ensure_host_header(out_req.headers_mut(), &upstream_target.authority)?;
     out_req =
         maybe_apply_request_throttle(out_req, &state.throttle, &target.scheme, &target.authority);
 
     let timeout = upstream_request_timeout();
     let upstream_resp = if state.transparent {
-        match tokio::time::timeout(timeout, transparent_upstream_request(out_req, &target)).await {
+        match tokio::time::timeout(timeout, transparent_upstream_request(out_req, &upstream_target))
+            .await
+        {
             Ok(result) => result?,
             Err(_) => {
                 return Ok(text_response(
@@ -1591,28 +1606,56 @@ async fn proxy_http(
             &mut out_resp,
         );
 
-        tracing::info!(
-            peer = %peer,
-            method = %method,
-            url = %request_url,
-            status = %out_resp.status(),
-            "upstream"
-        );
         let response_size_bytes = response_size_from_headers(out_resp.headers());
-        emit_entry_log(
-            state.plugin.as_ref(),
-            json!({
-                "type": "entry",
-                "event": "upstream",
-                "request_id": request_id.as_ref(),
-                "peer": peer.to_string(),
-                "method": method.as_str(),
-                "url": request_url.as_ref(),
-                "status": out_resp.status().as_u16(),
-                "duration_ms": elapsed_millis(request_started_at),
-                "response_size_bytes": response_size_bytes
-            }),
-        );
+        if let Some((map_remote_matcher, map_remote_to)) = map_remote_applied.as_ref() {
+            tracing::info!(
+                peer = %peer,
+                method = %method,
+                url = %request_url,
+                status = %out_resp.status(),
+                map_remote = %map_remote_matcher,
+                map_remote_to = %map_remote_to,
+                "map_remote"
+            );
+            emit_entry_log(
+                state.plugin.as_ref(),
+                json!({
+                    "type": "entry",
+                    "event": "map_remote",
+                    "request_id": request_id.as_ref(),
+                    "peer": peer.to_string(),
+                    "method": method.as_str(),
+                    "url": request_url.as_ref(),
+                    "status": out_resp.status().as_u16(),
+                    "map_remote": map_remote_matcher,
+                    "map_remote_to": map_remote_to,
+                    "duration_ms": elapsed_millis(request_started_at),
+                    "response_size_bytes": response_size_bytes
+                }),
+            );
+        } else {
+            tracing::info!(
+                peer = %peer,
+                method = %method,
+                url = %request_url,
+                status = %out_resp.status(),
+                "upstream"
+            );
+            emit_entry_log(
+                state.plugin.as_ref(),
+                json!({
+                    "type": "entry",
+                    "event": "upstream",
+                    "request_id": request_id.as_ref(),
+                    "peer": peer.to_string(),
+                    "method": method.as_str(),
+                    "url": request_url.as_ref(),
+                    "status": out_resp.status().as_u16(),
+                    "duration_ms": elapsed_millis(request_started_at),
+                    "response_size_bytes": response_size_bytes
+                }),
+            );
+        }
     }
 
     Ok(
@@ -1659,6 +1702,7 @@ async fn maybe_apply_response_throttle(
     resp
 }
 
+#[derive(Clone)]
 struct ResolvedTarget {
     scheme: String,
     authority: String,
@@ -1703,14 +1747,79 @@ fn resolve_target(uri: &Uri, headers: &HeaderMap, ctx: &RequestContext) -> Resul
 
 fn request_url_for_log(uri: &Uri, headers: &HeaderMap, ctx: &RequestContext) -> String {
     if let Ok(target) = resolve_target(uri, headers, ctx) {
-        let path_and_query = target
-            .uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        return format!("{}://{}{}", target.scheme, target.authority, path_and_query);
+        return resolved_target_url(&target);
     }
     uri.to_string()
+}
+
+fn resolved_target_url(target: &ResolvedTarget) -> String {
+    let path_and_query = target
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    format!("{}://{}{}", target.scheme, target.authority, path_and_query)
+}
+
+fn rewrite_map_remote_target(
+    original: &ResolvedTarget,
+    original_path_and_query: &str,
+    rule: &crate::rules::MapRemoteRule,
+) -> Result<ResolvedTarget> {
+    let matcher = rule.matcher.raw().trim();
+    let suffix = if matcher.starts_with("http://") || matcher.starts_with("https://") {
+        let full = resolved_target_url(original);
+        full.strip_prefix(matcher)
+            .ok_or_else(|| anyhow::anyhow!("source URL does not match map_remote prefix '{}'", matcher))?
+            .to_string()
+    } else if matcher.starts_with('/') {
+        original_path_and_query
+            .strip_prefix(matcher)
+            .ok_or_else(|| anyhow::anyhow!("source path does not match map_remote prefix"))?
+            .to_string()
+    } else {
+        let authority_and_path = format!("{}{}", original.authority, original_path_and_query);
+        authority_and_path
+            .strip_prefix(matcher)
+            .ok_or_else(|| anyhow::anyhow!("source authority/path does not match map_remote prefix"))?
+            .to_string()
+    };
+
+    let destination = rule.destination.trim();
+    let rewritten = format!("{destination}{suffix}");
+    parse_absolute_target_url(&rewritten)
+}
+
+fn parse_absolute_target_url(raw_url: &str) -> Result<ResolvedTarget> {
+    let parsed = raw_url
+        .parse::<Uri>()
+        .with_context(|| format!("invalid map_remote destination URL: {raw_url}"))?;
+    let scheme = parsed
+        .scheme_str()
+        .ok_or_else(|| anyhow::anyhow!("map_remote destination requires scheme"))?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        anyhow::bail!("map_remote destination scheme must be http or https");
+    }
+    let authority = parsed
+        .authority()
+        .ok_or_else(|| anyhow::anyhow!("map_remote destination requires authority"))?
+        .to_string();
+    let path_and_query = parsed
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    let uri = Uri::builder()
+        .scheme(scheme)
+        .authority(authority.as_str())
+        .path_and_query(path_and_query)
+        .build()
+        .context("failed to normalize map_remote destination URL")?;
+
+    Ok(ResolvedTarget {
+        scheme: scheme.to_string(),
+        authority,
+        uri,
+    })
 }
 
 async fn map_local_response(
@@ -1920,6 +2029,7 @@ mod tests {
     use std::fs;
 
     use base64::Engine as _;
+    use crate::rules::Matcher;
 
     use super::*;
 
@@ -2146,6 +2256,28 @@ mod tests {
         assert_eq!(
             normalize_client_ip(mapped),
             "192.168.0.8".parse::<IpAddr>().expect("ipv4 parse")
+        );
+    }
+
+    #[test]
+    fn rewrite_map_remote_target_rewrites_authority_path_prefix() {
+        let original = ResolvedTarget {
+            scheme: "https".to_string(),
+            authority: "api.example.com".to_string(),
+            uri: "https://api.example.com/v1/users?id=1"
+                .parse()
+                .expect("original uri"),
+        };
+        let rule = crate::rules::MapRemoteRule {
+            matcher: Matcher::new("api.example.com/v1"),
+            destination: "https://staging.example.com/v2".to_string(),
+        };
+
+        let rewritten = rewrite_map_remote_target(&original, "/v1/users?id=1", &rule)
+            .expect("rewrite map_remote target");
+        assert_eq!(
+            resolved_target_url(&rewritten),
+            "https://staging.example.com/v2/users?id=1"
         );
     }
 
