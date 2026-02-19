@@ -1039,6 +1039,7 @@ pub extern "C" fn crab_proxy_start(handle: *mut CrabProxyHandle) -> CrabResult {
                     client_access,
                     Some(transparent),
                     shutdown_rx,
+                    None,
                 )
                 .await;
                 running.store(false, Ordering::SeqCst);

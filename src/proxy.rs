@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::{OnceLock, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,7 +29,7 @@ use rustls::RootCertStore;
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::io::ReaderStream;
 use x509_parser::extensions::GeneralName;
@@ -60,6 +61,15 @@ type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, ProxyBody>;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+type StructuredLogCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
+static STRUCTURED_LOG_CALLBACK: OnceLock<RwLock<Option<StructuredLogCallback>>> = OnceLock::new();
+
+pub fn set_structured_log_callback(callback: Option<StructuredLogCallback>) {
+    let store = STRUCTURED_LOG_CALLBACK.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = store.write() {
+        *guard = callback;
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct InspectConfig {
@@ -208,6 +218,7 @@ pub async fn run(
         client_access,
         transparent,
         shutdown_rx,
+        None,
     )
     .await
 }
@@ -221,22 +232,40 @@ pub async fn run_with_shutdown(
     client_access: Arc<ClientAccessConfig>,
     transparent: Option<TransparentConfig>,
     mut shutdown_rx: watch::Receiver<bool>,
+    mut ready_tx: Option<oneshot::Sender<std::result::Result<(), String>>>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(listen)
-        .await
-        .with_context(|| format!("failed to bind: {listen}"))?;
+    let listener = match TcpListener::bind(listen).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            notify_startup_error(
+                &mut ready_tx,
+                format!("failed to bind listener {listen}: {err}"),
+            );
+            return Err(err).with_context(|| format!("failed to bind: {listen}"));
+        }
+    };
 
     let transparent_listener = match transparent.as_ref() {
         Some(cfg) if cfg.enabled => {
             let addr = format!("127.0.0.1:{}", cfg.listen_port);
-            let tl = TcpListener::bind(&addr)
-                .await
-                .with_context(|| format!("failed to bind transparent listener: {addr}"))?;
+            let tl = match TcpListener::bind(&addr).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    notify_startup_error(
+                        &mut ready_tx,
+                        format!("failed to bind transparent listener {addr}: {err}"),
+                    );
+                    return Err(err)
+                        .with_context(|| format!("failed to bind transparent listener: {addr}"));
+                }
+            };
             tracing::info!(listen = %addr, "transparent proxy listening");
             Some(tl)
         }
         _ => None,
     };
+
+    notify_startup_ready(&mut ready_tx);
 
     let plugin = PluginRuntime::from_env();
     if let Some(runtime) = plugin.as_ref() {
@@ -337,6 +366,23 @@ pub async fn run_with_shutdown(
     }
 
     Ok(())
+}
+
+fn notify_startup_ready(
+    ready_tx: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
+) {
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(Ok(()));
+    }
+}
+
+fn notify_startup_error(
+    ready_tx: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
+    message: String,
+) {
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(Err(message));
+    }
 }
 
 fn is_client_ip_allowed(peer: SocketAddr, client_access: &ClientAccessConfig) -> bool {
@@ -2021,7 +2067,15 @@ fn response_size_from_headers(headers: &HeaderMap) -> Option<u64> {
 }
 
 fn emit_structured_log(payload: serde_json::Value) {
-    tracing::info!("CRAB_JSON {}", payload);
+    let line = format!("CRAB_JSON {}", payload);
+    tracing::info!("{}", line);
+
+    let callback = STRUCTURED_LOG_CALLBACK
+        .get()
+        .and_then(|store| store.read().ok().and_then(|guard| guard.clone()));
+    if let Some(callback) = callback {
+        callback(line);
+    }
 }
 
 #[cfg(test)]
