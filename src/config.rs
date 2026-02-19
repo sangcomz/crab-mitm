@@ -104,7 +104,7 @@ pub fn load_rules(
 
         for m in file_cfg.map_local {
             let source = match (m.file, m.text) {
-                (Some(f), None) => MapSource::File(resolve_path(base_dir, &f)),
+                (Some(f), None) => MapSource::File(resolve_and_validate_path(base_dir, &f)?),
                 (None, Some(t)) => MapSource::Text(t),
                 (None, None) => anyhow::bail!(
                     "map_local rule '{}' must set either 'file' or 'text'",
@@ -163,12 +163,36 @@ fn split_kv(input: &str) -> Option<(&str, &str)> {
     Some((k, v))
 }
 
-fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
+fn resolve_and_validate_path(base_dir: &Path, path: &Path) -> Result<PathBuf> {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "map_local file path must not contain parent-directory traversals: {}",
+            path.display()
+        );
+    }
+
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         base_dir.join(path)
+    };
+
+    let canonical = std::fs::canonicalize(&absolute)
+        .with_context(|| format!("map_local file not found: {}", absolute.display()))?;
+
+    let meta = std::fs::metadata(&canonical)
+        .with_context(|| format!("cannot read map_local file: {}", canonical.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!(
+            "map_local path is not a regular file: {}",
+            canonical.display()
+        );
     }
+
+    Ok(canonical)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -273,8 +297,9 @@ to = 503
         let rules = load_rules(Some(&cfg_path), &[], &[cli_rewrite]).expect("load rules");
 
         assert_eq!(rules.map_local.len(), 1);
+        let canonical_local = fs::canonicalize(&local_path).expect("canonicalize local_path");
         match &rules.map_local[0].source {
-            MapSource::File(path) => assert_eq!(path, &local_path),
+            MapSource::File(path) => assert_eq!(path, &canonical_local),
             _ => panic!("expected map_local file source"),
         }
         assert_eq!(rules.map_local[0].status, StatusCode::CREATED);

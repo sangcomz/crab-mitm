@@ -28,7 +28,7 @@ use rustls::RootCertStore;
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::io::ReaderStream;
 use x509_parser::extensions::GeneralName;
@@ -99,6 +99,22 @@ impl ThrottleConfig {
 
     fn is_active_for(&self, scheme: &str, authority: &str) -> bool {
         self.enabled && self.has_throttle_limits() && self.matches_location(scheme, authority)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClientAccessConfig {
+    pub enforce_allowlist: bool,
+    pub allowed_client_ips: Vec<IpAddr>,
+}
+
+pub fn normalize_client_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(value) => value
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(value)),
+        value => value,
     }
 }
 
@@ -174,6 +190,7 @@ pub async fn run(
     rules: Arc<Rules>,
     inspect: Arc<InspectConfig>,
     throttle: Arc<ThrottleConfig>,
+    client_access: Arc<ClientAccessConfig>,
     transparent: Option<TransparentConfig>,
 ) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -188,6 +205,7 @@ pub async fn run(
         rules,
         inspect,
         throttle,
+        client_access,
         transparent,
         shutdown_rx,
     )
@@ -200,6 +218,7 @@ pub async fn run_with_shutdown(
     rules: Arc<Rules>,
     inspect: Arc<InspectConfig>,
     throttle: Arc<ThrottleConfig>,
+    client_access: Arc<ClientAccessConfig>,
     transparent: Option<TransparentConfig>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -261,14 +280,29 @@ pub async fn run_with_shutdown(
         transparent: true,
     };
 
-    tracing::info!(listen = %listen, "proxy listening");
+    let max_conn = max_connections();
+    let semaphore = Arc::new(Semaphore::new(max_conn));
+    tracing::info!(
+        listen = %listen,
+        max_connections = max_conn,
+        lan_allowlist_enforced = client_access.enforce_allowlist,
+        lan_allowlist_count = client_access.allowed_client_ips.len(),
+        "proxy listening"
+    );
 
     loop {
         tokio::select! {
             res = listener.accept() => {
                 let (stream, peer) = res?;
+                if !is_client_ip_allowed(peer, client_access.as_ref()) {
+                    log_blocked_client(peer);
+                    continue;
+                }
+                let permit = semaphore.clone().acquire_owned().await;
+                let Ok(permit) = permit else { break; };
                 let state = forward_state.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(err) = serve_client(stream, peer, state).await {
                         tracing::debug!(peer = %peer, error = %err, "connection ended");
                     }
@@ -276,8 +310,15 @@ pub async fn run_with_shutdown(
             }
             res = accept_transparent(&transparent_listener) => {
                 if let Some((stream, peer)) = res? {
+                    if !is_client_ip_allowed(peer, client_access.as_ref()) {
+                        log_blocked_client(peer);
+                        continue;
+                    }
+                    let permit = semaphore.clone().acquire_owned().await;
+                    let Ok(permit) = permit else { break; };
                     let state = transparent_state.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(err) = serve_transparent_client(stream, peer, state).await {
                             tracing::debug!(peer = %peer, error = %err, "transparent connection ended");
                         }
@@ -296,6 +337,33 @@ pub async fn run_with_shutdown(
     }
 
     Ok(())
+}
+
+fn is_client_ip_allowed(peer: SocketAddr, client_access: &ClientAccessConfig) -> bool {
+    if !client_access.enforce_allowlist {
+        return true;
+    }
+
+    let ip = normalize_client_ip(peer.ip());
+    if ip.is_loopback() {
+        return true;
+    }
+
+    client_access
+        .allowed_client_ips
+        .iter()
+        .copied()
+        .map(normalize_client_ip)
+        .any(|allowed| allowed == ip)
+}
+
+fn log_blocked_client(peer: SocketAddr) {
+    let ip = normalize_client_ip(peer.ip());
+    tracing::warn!(
+        peer = %peer,
+        ip = %ip,
+        "LAN_ACCESS_REQUEST ip={ip}"
+    );
 }
 
 async fn accept_transparent(
@@ -787,11 +855,7 @@ async fn serve_transparent_http(
     Ok(())
 }
 
-fn is_connect_target_blocked(host: &str, port: u16) -> bool {
-    if !connect_private_block_enabled() {
-        return false;
-    }
-
+fn is_private_target(host: &str, port: u16) -> bool {
     if is_blocked_connect_host_literal(host) {
         return true;
     }
@@ -801,10 +865,18 @@ fn is_connect_target_blocked(host: &str, port: u16) -> bool {
             .into_iter()
             .any(|addr| is_blocked_connect_ip(addr.ip())),
         Err(err) => {
-            tracing::debug!(target = %host, error = %err, "CONNECT target DNS lookup failed");
+            tracing::debug!(target = %host, error = %err, "private target DNS lookup failed");
             false
         }
     }
+}
+
+fn is_connect_target_blocked(host: &str, port: u16) -> bool {
+    connect_private_block_enabled() && is_private_target(host, port)
+}
+
+fn is_http_target_blocked(host: &str, port: u16) -> bool {
+    http_private_block_enabled() && is_private_target(host, port)
 }
 
 fn connect_private_block_enabled() -> bool {
@@ -812,6 +884,28 @@ fn connect_private_block_enabled() -> bool {
         std::env::var("CRAB_CONNECT_BLOCK_PRIVATE").ok().as_deref(),
         true,
     )
+}
+
+fn http_private_block_enabled() -> bool {
+    parse_env_bool(
+        std::env::var("CRAB_HTTP_BLOCK_PRIVATE").ok().as_deref(),
+        true,
+    )
+}
+
+fn upstream_request_timeout() -> Duration {
+    let ms = parse_env_u64(
+        std::env::var("CRAB_UPSTREAM_TIMEOUT_MS").ok().as_deref(),
+        30_000,
+    );
+    Duration::from_millis(ms)
+}
+
+fn max_connections() -> usize {
+    parse_env_u64(
+        std::env::var("CRAB_MAX_CONNECTIONS").ok().as_deref(),
+        4096,
+    ) as usize
 }
 
 fn upstream_san_sniff_enabled() -> bool {
@@ -1226,6 +1320,28 @@ async fn proxy_http(
     let method = parts.method.clone();
     let target = resolve_target(&parts.uri, &parts.headers, &ctx)?;
 
+    {
+        let auth: http::uri::Authority = target
+            .authority
+            .parse()
+            .context("failed to parse target authority")?;
+        let host = auth.host();
+        let port = auth
+            .port_u16()
+            .unwrap_or(if target.scheme == "https" { 443 } else { 80 });
+        if is_http_target_blocked(host, port) {
+            tracing::warn!(
+                peer = %peer,
+                target = %target.authority,
+                "HTTP target blocked by policy"
+            );
+            return Ok(text_response(
+                StatusCode::FORBIDDEN,
+                "HTTP target blocked by policy\n".to_string(),
+            ));
+        }
+    }
+
     let path_and_query = target
         .uri
         .path_and_query()
@@ -1399,14 +1515,27 @@ async fn proxy_http(
     out_req =
         maybe_apply_request_throttle(out_req, &state.throttle, &target.scheme, &target.authority);
 
+    let timeout = upstream_request_timeout();
     let upstream_resp = if state.transparent {
-        transparent_upstream_request(out_req, &target).await?
+        match tokio::time::timeout(timeout, transparent_upstream_request(out_req, &target)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Ok(text_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream request timed out\n".to_string(),
+                ));
+            }
+        }
     } else {
-        state
-            .client
-            .request(out_req)
-            .await
-            .context("upstream request failed")?
+        match tokio::time::timeout(timeout, state.client.request(out_req)).await {
+            Ok(result) => result.context("upstream request failed")?,
+            Err(_) => {
+                return Ok(text_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream request timed out\n".to_string(),
+                ));
+            }
+        }
     };
     let (mut resp_parts, resp_body) = upstream_resp.into_parts();
 
@@ -2007,6 +2136,47 @@ mod tests {
         };
 
         assert!(cfg.is_active_for("https", "any-host.test:443"));
+    }
+
+    #[test]
+    fn normalize_client_ip_converts_ipv4_mapped_ipv6() {
+        let mapped: IpAddr = "::ffff:192.168.0.8"
+            .parse()
+            .expect("ipv4-mapped ipv6 parse");
+        assert_eq!(
+            normalize_client_ip(mapped),
+            "192.168.0.8".parse::<IpAddr>().expect("ipv4 parse")
+        );
+    }
+
+    #[test]
+    fn client_access_enforced_allows_loopback_without_explicit_rule() {
+        let cfg = ClientAccessConfig {
+            enforce_allowlist: true,
+            allowed_client_ips: vec![],
+        };
+        let peer: SocketAddr = "127.0.0.1:50000".parse().expect("socket addr");
+        assert!(is_client_ip_allowed(peer, &cfg));
+    }
+
+    #[test]
+    fn client_access_enforced_blocks_unknown_lan_ip() {
+        let cfg = ClientAccessConfig {
+            enforce_allowlist: true,
+            allowed_client_ips: vec!["192.168.0.99".parse().expect("allowed ip")],
+        };
+        let peer: SocketAddr = "192.168.0.20:50000".parse().expect("socket addr");
+        assert!(!is_client_ip_allowed(peer, &cfg));
+    }
+
+    #[test]
+    fn client_access_enforced_allows_configured_lan_ip() {
+        let cfg = ClientAccessConfig {
+            enforce_allowlist: true,
+            allowed_client_ips: vec!["192.168.0.20".parse().expect("allowed ip")],
+        };
+        let peer: SocketAddr = "192.168.0.20:50000".parse().expect("socket addr");
+        assert!(is_client_ip_allowed(peer, &cfg));
     }
 
     #[test]

@@ -39,6 +39,9 @@ CrabResult crab_proxy_set_throttle_upstream_bps(CrabProxyHandle *handle, uint64_
 CrabResult crab_proxy_set_throttle_only_selected_hosts(CrabProxyHandle *handle, bool enabled);
 CrabResult crab_proxy_throttle_hosts_clear(CrabProxyHandle *handle);
 CrabResult crab_proxy_throttle_hosts_add(CrabProxyHandle *handle, const char *matcher);
+CrabResult crab_proxy_set_client_allowlist_enabled(CrabProxyHandle *handle, bool enabled);
+CrabResult crab_proxy_client_allowlist_clear(CrabProxyHandle *handle);
+CrabResult crab_proxy_client_allowlist_add_ip(CrabProxyHandle *handle, const char *ip_addr);
 CrabResult crab_proxy_set_transparent_enabled(CrabProxyHandle *handle, bool enabled);
 CrabResult crab_proxy_set_transparent_port(CrabProxyHandle *handle, uint16_t port);
 CrabResult crab_proxy_rules_clear(CrabProxyHandle *handle);

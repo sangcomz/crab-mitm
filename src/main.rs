@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
                 spool_max_bytes: args.inspect_spool_max_bytes,
             });
             let throttle = Arc::new(proxy::ThrottleConfig::default());
+            let client_access = Arc::new(proxy::ClientAccessConfig::default());
 
             let ca =
                 match (&args.ca_cert, &args.ca_key) {
@@ -163,7 +164,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            proxy::run(&args.listen, ca, rules, inspect, throttle, None).await
+            proxy::run(&args.listen, ca, rules, inspect, throttle, client_access, None).await
         }
     }
 }

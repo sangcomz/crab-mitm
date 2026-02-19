@@ -8,7 +8,7 @@ use http::StatusCode;
 use tokio::sync::watch;
 
 use crate::ca::{self, CaKeyAlgorithm, CertificateAuthority};
-use crate::proxy::{self, InspectConfig, ThrottleConfig, TransparentConfig};
+use crate::proxy::{self, ClientAccessConfig, InspectConfig, ThrottleConfig, TransparentConfig};
 use crate::rules::{AllowRule, MapLocalRule, MapSource, Matcher, Rules, StatusRewriteRule};
 
 const CRAB_OK: i32 = 0;
@@ -25,6 +25,7 @@ pub struct CrabProxyHandle {
     rules: Mutex<Rules>,
     inspect: Mutex<InspectConfig>,
     throttle: Mutex<ThrottleConfig>,
+    client_access: Mutex<ClientAccessConfig>,
     transparent: Mutex<TransparentConfig>,
     shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
     task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
@@ -520,6 +521,7 @@ pub extern "C" fn crab_proxy_create(
                 spool_max_bytes: 100 * 1024 * 1024,
             }),
             throttle: Mutex::new(ThrottleConfig::default()),
+            client_access: Mutex::new(ClientAccessConfig::default()),
             transparent: Mutex::new(TransparentConfig::default()),
             shutdown_tx: Mutex::new(None),
             task: Mutex::new(None),
@@ -714,6 +716,63 @@ pub extern "C" fn crab_proxy_throttle_hosts_add(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_set_client_allowlist_enabled(
+    handle: *mut CrabProxyHandle,
+    enabled: bool,
+) -> CrabResult {
+    ffi_entry!({
+        ffi_with_stopped_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.client_access, "client_access");
+            guard.enforce_allowlist = enabled;
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_client_allowlist_clear(handle: *mut CrabProxyHandle) -> CrabResult {
+    ffi_entry!({
+        ffi_with_stopped_handle!(handle, h, {
+            let mut guard = ffi_lock!(h.client_access, "client_access");
+            guard.allowed_client_ips.clear();
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn crab_proxy_client_allowlist_add_ip(
+    handle: *mut CrabProxyHandle,
+    ip_addr: *const c_char,
+) -> CrabResult {
+    ffi_entry!({
+        ffi_with_stopped_handle!(handle, h, {
+            let raw = ffi_try!(unsafe { require_cstr(ip_addr, "ip_addr") });
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return err_result(CRAB_ERR_INVALID_ARG, "ip_addr must not be empty");
+            }
+
+            let parsed = match trimmed.parse::<std::net::IpAddr>() {
+                Ok(value) => proxy::normalize_client_ip(value),
+                Err(_) => {
+                    return err_result(
+                        CRAB_ERR_INVALID_ARG,
+                        "ip_addr must be a valid IPv4 or IPv6 address",
+                    );
+                }
+            };
+
+            let mut guard = ffi_lock!(h.client_access, "client_access");
+            if !guard.allowed_client_ips.contains(&parsed) {
+                guard.allowed_client_ips.push(parsed);
+            }
+            ok_result()
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn crab_proxy_set_transparent_enabled(
     handle: *mut CrabProxyHandle,
     enabled: bool,
@@ -891,6 +950,7 @@ pub extern "C" fn crab_proxy_start(handle: *mut CrabProxyHandle) -> CrabResult {
             let rules = Arc::new(ffi_lock!(h.rules, "rules").clone());
             let inspect = Arc::new(ffi_lock!(h.inspect, "inspect").clone());
             let throttle = Arc::new(ffi_lock!(h.throttle, "throttle").clone());
+            let client_access = Arc::new(ffi_lock!(h.client_access, "client_access").clone());
             let transparent = ffi_lock!(h.transparent, "transparent").clone();
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -909,6 +969,7 @@ pub extern "C" fn crab_proxy_start(handle: *mut CrabProxyHandle) -> CrabResult {
                     rules,
                     inspect,
                     throttle,
+                    client_access,
                     Some(transparent),
                     shutdown_rx,
                 )
@@ -1193,6 +1254,30 @@ mod tests {
         let matcher = CString::new("example.com/*").expect("matcher cstring");
         let (code, message) =
             crab_result_to_owned(crab_proxy_rules_add_allow(handle.raw(), matcher.as_ptr()));
+        assert_eq!(code, CRAB_ERR_STATE);
+        assert!(message.contains("running"));
+
+        assert_ok(crab_proxy_stop(handle.raw()));
+    }
+
+    #[test]
+    fn ffi_client_allowlist_rejects_invalid_ip_literal() {
+        let handle = create_handle(None);
+        let ip = CString::new("not-an-ip").expect("cstring");
+        let (code, message) =
+            crab_result_to_owned(crab_proxy_client_allowlist_add_ip(handle.raw(), ip.as_ptr()));
+        assert_eq!(code, CRAB_ERR_INVALID_ARG);
+        assert!(message.contains("IPv4 or IPv6"));
+    }
+
+    #[test]
+    fn ffi_client_allowlist_changes_reject_while_running() {
+        let listen = format!("127.0.0.1:{}", choose_free_port());
+        let handle = create_handle(Some(&listen));
+        assert_ok(crab_proxy_start(handle.raw()));
+
+        let (code, message) =
+            crab_result_to_owned(crab_proxy_set_client_allowlist_enabled(handle.raw(), true));
         assert_eq!(code, CRAB_ERR_STATE);
         assert!(message.contains("running"));
 
