@@ -19,6 +19,10 @@ path = "src/bin/crabd.rs"
 name = "crabctl"
 path = "src/bin/crabctl.rs"
 
+[[bin]]
+name = "crab-mcp"
+path = "src/bin/crab-mcp.rs"
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"

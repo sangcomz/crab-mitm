@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -169,7 +169,11 @@ impl AuthManager {
         };
         let mcp = TokenPayload {
             aud: "mcp".to_string(),
-            scopes: vec!["read".to_string(), "rules.write".to_string()],
+            scopes: vec![
+                "read".to_string(),
+                "rules.write".to_string(),
+                "control".to_string(),
+            ],
             iat: now_unix_seconds(),
             jti: Uuid::new_v4().to_string(),
         };
@@ -323,6 +327,7 @@ pub async fn run_forever(options: DaemonOptions) -> Result<()> {
         .context("failed to write token files")?;
 
     let shared = Arc::new(Mutex::new(DaemonState::new()));
+    let (daemon_shutdown_tx, mut daemon_shutdown_rx) = watch::channel(false);
 
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<String>();
     proxy::set_structured_log_callback(Some(Arc::new(move |line: String| {
@@ -343,21 +348,44 @@ pub async fn run_forever(options: DaemonOptions) -> Result<()> {
     info!(socket = %paths.socket_path.display(), "crabd listening");
 
     loop {
-        let (stream, _) = listener.accept().await.context("accept failed")?;
-        let state = Arc::clone(&shared);
-        let auth = auth.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, state, auth).await {
-                tracing::debug!(error = %err, "connection closed with error");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.context("accept failed")?;
+                let state = Arc::clone(&shared);
+                let auth = auth.clone();
+                let shutdown_tx = daemon_shutdown_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_connection(stream, state, auth, shutdown_tx).await {
+                        tracing::debug!(error = %err, "connection closed with error");
+                    }
+                });
             }
-        });
+            changed = daemon_shutdown_rx.changed() => {
+                if changed.is_ok() && *daemon_shutdown_rx.borrow() {
+                    break;
+                }
+                if changed.is_err() {
+                    break;
+                }
+            }
+        }
     }
+
+    proxy::set_structured_log_callback(None);
+    if let Err(err) = std::fs::remove_file(&paths.socket_path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(error = %err, socket = %paths.socket_path.display(), "failed to remove daemon socket");
+    }
+
+    Ok(())
 }
 
 async fn handle_connection(
     stream: UnixStream,
     state: Arc<Mutex<DaemonState>>,
     auth: AuthManager,
+    daemon_shutdown_tx: watch::Sender<bool>,
 ) -> Result<()> {
     let peer = stream.peer_cred().context("failed to read peer credentials")?;
     let peer_uid = peer.uid();
@@ -397,7 +425,16 @@ async fn handle_connection(
         };
 
         let id = req.id.clone();
-        let response = match dispatch_request(&req, &state, &auth, &mut session, peer_pid).await {
+        let response = match dispatch_request(
+            &req,
+            &state,
+            &auth,
+            &mut session,
+            peer_pid,
+            &daemon_shutdown_tx,
+        )
+        .await
+        {
             Ok(value) => RpcResponse::success(id, value),
             Err((code, message)) => RpcResponse::failure(id, code, message),
         };
@@ -414,6 +451,7 @@ async fn dispatch_request(
     auth: &AuthManager,
     session: &mut Option<Session>,
     peer_pid: Option<i32>,
+    daemon_shutdown_tx: &watch::Sender<bool>,
 ) -> std::result::Result<Value, (i32, String)> {
     if req.jsonrpc != "2.0" {
         return Err((INVALID_PARAMS, "jsonrpc must be 2.0".to_string()));
@@ -458,6 +496,7 @@ async fn dispatch_request(
                 Ok(json!({"rotated": true, "reconnect_required": true}))
             }
         }
+        "system.shutdown" => shutdown_daemon(state, daemon_shutdown_tx).await,
         "proxy.start" => start_proxy(state).await,
         "proxy.stop" => stop_proxy(state).await,
         "proxy.status" => {
@@ -588,6 +627,128 @@ async fn dispatch_request(
                 guard.config.throttle.selected_hosts = selected_hosts;
                 Ok(json!({"ok": true}))
             }
+        }
+        "engine.config_dump" => {
+            let guard = state.lock().await;
+            let throttle_selected_hosts = guard
+                .config
+                .throttle
+                .selected_hosts
+                .iter()
+                .map(|rule| rule.raw().to_string())
+                .collect::<Vec<_>>();
+            let allowlist_ips = guard
+                .config
+                .client_access
+                .allowed_client_ips
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect::<Vec<_>>();
+            let ca_cert_path = guard
+                .config
+                .ca_cert_path
+                .as_ref()
+                .map(|path| path.display().to_string());
+            let ca_key_path = guard
+                .config
+                .ca_key_path
+                .as_ref()
+                .map(|path| path.display().to_string());
+            let ca_loaded = ca_cert_path.is_some() && ca_key_path.is_some();
+
+            Ok(json!({
+                "running": guard.running,
+                "listen_addr": guard.config.listen_addr,
+                "inspect": {
+                    "enabled": guard.config.inspect.enabled,
+                    "sample_bytes": guard.config.inspect.sample_bytes,
+                    "spool": guard.config.inspect.spool,
+                    "spool_dir": guard.config.inspect.spool_dir.as_ref().map(|path| path.display().to_string()),
+                    "spool_max_bytes": guard.config.inspect.spool_max_bytes,
+                },
+                "throttle": {
+                    "enabled": guard.config.throttle.enabled,
+                    "latency_ms": guard.config.throttle.latency_ms,
+                    "downstream_bps": guard.config.throttle.downstream_bytes_per_sec,
+                    "upstream_bps": guard.config.throttle.upstream_bytes_per_sec,
+                    "only_selected_hosts": guard.config.throttle.only_selected_hosts,
+                    "selected_hosts": throttle_selected_hosts,
+                },
+                "client_allowlist": {
+                    "enabled": guard.config.client_access.enforce_allowlist,
+                    "ips": allowlist_ips,
+                },
+                "transparent": {
+                    "enabled": guard.config.transparent.enabled,
+                    "listen_port": guard.config.transparent.listen_port,
+                },
+                "ca": {
+                    "loaded": ca_loaded,
+                    "cert_path": ca_cert_path,
+                    "key_path": ca_key_path,
+                }
+            }))
+        }
+        "engine.rules_dump" => {
+            let guard = state.lock().await;
+            let allowlist = guard
+                .rules
+                .allowlist
+                .iter()
+                .map(|rule| rule.raw().to_string())
+                .collect::<Vec<_>>();
+            let map_local = guard
+                .rules
+                .map_local
+                .iter()
+                .map(|rule| {
+                    let source = match &rule.source {
+                        MapSource::File(path) => json!({
+                            "kind": "file",
+                            "value": path.display().to_string(),
+                        }),
+                        MapSource::Text(value) => json!({
+                            "kind": "text",
+                            "value": value,
+                        }),
+                    };
+                    json!({
+                        "matcher": rule.matcher.raw(),
+                        "source": source,
+                        "status_code": rule.status.as_u16(),
+                        "content_type": rule.content_type,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let map_remote = guard
+                .rules
+                .map_remote
+                .iter()
+                .map(|rule| {
+                    json!({
+                        "matcher": rule.matcher.raw(),
+                        "destination": rule.destination,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let status_rewrite = guard
+                .rules
+                .status_rewrite
+                .iter()
+                .map(|rule| {
+                    json!({
+                        "matcher": rule.matcher.raw(),
+                        "from_status_code": rule.from.map(|value| value.as_u16()),
+                        "to_status_code": rule.to.as_u16(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "allowlist": allowlist,
+                "map_local": map_local,
+                "map_remote": map_remote,
+                "status_rewrite": status_rewrite,
+            }))
         }
         "engine.rules_clear" => {
             let mut guard = state.lock().await;
@@ -754,6 +915,189 @@ async fn dispatch_request(
                 Ok(json!({"ok": true}))
             }
         }
+        "engine.rules_remove_allow" => {
+            let matcher = param_as_str(&params, "matcher")
+                .map_err(|e| (INVALID_PARAMS, e))?
+                .ok_or_else(|| (INVALID_PARAMS, "matcher is required".to_string()))?;
+            let matcher = matcher.trim();
+            if matcher.is_empty() {
+                return Err((INVALID_PARAMS, "matcher is required".to_string()));
+            }
+
+            let mut guard = state.lock().await;
+            if guard.running {
+                Err((STATE_ERROR, "cannot change rules while running".to_string()))
+            } else {
+                let before = guard.rules.allowlist.len();
+                guard.rules.allowlist.retain(|rule| rule.raw() != matcher);
+                let removed = before.saturating_sub(guard.rules.allowlist.len());
+                Ok(json!({"ok": true, "removed": removed}))
+            }
+        }
+        "engine.rules_remove_map_local" => {
+            let matcher = param_as_str(&params, "matcher")
+                .map_err(|e| (INVALID_PARAMS, e))?
+                .ok_or_else(|| (INVALID_PARAMS, "matcher is required".to_string()))?;
+            let matcher = matcher.trim();
+            if matcher.is_empty() {
+                return Err((INVALID_PARAMS, "matcher is required".to_string()));
+            }
+
+            let source_kind = param_as_str(&params, "source_kind")
+                .map_err(|e| (INVALID_PARAMS, e))?
+                .map(|raw| raw.trim().to_ascii_lowercase());
+            if let Some(kind) = source_kind.as_deref()
+                && kind != "file"
+                && kind != "text"
+            {
+                return Err((
+                    INVALID_PARAMS,
+                    "source_kind must be 'file' or 'text'".to_string(),
+                ));
+            }
+            let source_value = param_as_str(&params, "source_value")
+                .map_err(|e| (INVALID_PARAMS, e))?
+                .map(|raw| raw.to_string());
+
+            let mut guard = state.lock().await;
+            if guard.running {
+                Err((STATE_ERROR, "cannot change rules while running".to_string()))
+            } else {
+                let before = guard.rules.map_local.len();
+                guard.rules.map_local.retain(|rule| {
+                    if rule.matcher.raw() != matcher {
+                        return true;
+                    }
+
+                    if let Some(kind) = source_kind.as_deref() {
+                        let kind_match = match (&rule.source, kind) {
+                            (MapSource::File(_), "file") => true,
+                            (MapSource::Text(_), "text") => true,
+                            _ => false,
+                        };
+                        if !kind_match {
+                            return true;
+                        }
+                    }
+
+                    if let Some(expected_value) = source_value.as_ref() {
+                        let value_match = match &rule.source {
+                            MapSource::File(path) => path.display().to_string() == *expected_value,
+                            MapSource::Text(text) => text == expected_value,
+                        };
+                        if !value_match {
+                            return true;
+                        }
+                    }
+
+                    false
+                });
+
+                let removed = before.saturating_sub(guard.rules.map_local.len());
+                Ok(json!({"ok": true, "removed": removed}))
+            }
+        }
+        "engine.rules_remove_map_remote" => {
+            let matcher = param_as_str(&params, "matcher")
+                .map_err(|e| (INVALID_PARAMS, e))?
+                .ok_or_else(|| (INVALID_PARAMS, "matcher is required".to_string()))?;
+            let matcher = matcher.trim();
+            if matcher.is_empty() {
+                return Err((INVALID_PARAMS, "matcher is required".to_string()));
+            }
+            let destination = param_as_str(&params, "destination")
+                .map_err(|e| (INVALID_PARAMS, e))?
+                .map(|raw| raw.to_string());
+
+            let mut guard = state.lock().await;
+            if guard.running {
+                Err((STATE_ERROR, "cannot change rules while running".to_string()))
+            } else {
+                let before = guard.rules.map_remote.len();
+                guard.rules.map_remote.retain(|rule| {
+                    if rule.matcher.raw() != matcher {
+                        return true;
+                    }
+                    if let Some(expected_destination) = destination.as_ref()
+                        && &rule.destination != expected_destination
+                    {
+                        return true;
+                    }
+                    false
+                });
+                let removed = before.saturating_sub(guard.rules.map_remote.len());
+                Ok(json!({"ok": true, "removed": removed}))
+            }
+        }
+        "engine.rules_remove_status_rewrite" => {
+            let matcher = param_as_str(&params, "matcher")
+                .map_err(|e| (INVALID_PARAMS, e))?
+                .ok_or_else(|| (INVALID_PARAMS, "matcher is required".to_string()))?;
+            let matcher = matcher.trim();
+            if matcher.is_empty() {
+                return Err((INVALID_PARAMS, "matcher is required".to_string()));
+            }
+
+            let from_filter = match param_as_i64(&params, "from_status_code")
+                .map_err(|e| (INVALID_PARAMS, e))?
+            {
+                None => None,
+                Some(raw) if raw < 0 => Some(None),
+                Some(raw) => {
+                    let status = match http::StatusCode::from_u16(raw as u16) {
+                        Ok(status) => status,
+                        Err(_) => {
+                            return Err((
+                                INVALID_PARAMS,
+                                "from_status_code must be -1 or valid HTTP status".to_string(),
+                            ));
+                        }
+                    };
+                    Some(Some(status))
+                }
+            };
+
+            let to_filter = match param_as_u64(&params, "to_status_code")
+                .map_err(|e| (INVALID_PARAMS, e))?
+            {
+                None => None,
+                Some(raw) => match http::StatusCode::from_u16(raw as u16) {
+                    Ok(status) => Some(status),
+                    Err(_) => {
+                        return Err((
+                            INVALID_PARAMS,
+                            "to_status_code must be valid HTTP status".to_string(),
+                        ));
+                    }
+                },
+            };
+
+            let mut guard = state.lock().await;
+            if guard.running {
+                Err((STATE_ERROR, "cannot change rules while running".to_string()))
+            } else {
+                let before = guard.rules.status_rewrite.len();
+                guard.rules.status_rewrite.retain(|rule| {
+                    if rule.matcher.raw() != matcher {
+                        return true;
+                    }
+                    if let Some(from_expected) = from_filter
+                        && rule.from != from_expected
+                    {
+                        return true;
+                    }
+                    if let Some(to_expected) = to_filter
+                        && rule.to != to_expected
+                    {
+                        return true;
+                    }
+                    false
+                });
+
+                let removed = before.saturating_sub(guard.rules.status_rewrite.len());
+                Ok(json!({"ok": true, "removed": removed}))
+            }
+        }
         "logs.tail" => {
             let after_seq = param_as_u64(&params, "after_seq")
                 .map_err(|e| (INVALID_PARAMS, e))?
@@ -796,10 +1140,16 @@ async fn dispatch_request(
 fn required_scope(method: &str) -> Option<&'static str> {
     match method {
         "system.handshake" => None,
-        "system.ping" | "system.version" | "proxy.status" | "logs.tail" | "daemon.doctor" => {
+        "system.ping"
+        | "system.version"
+        | "proxy.status"
+        | "logs.tail"
+        | "daemon.doctor"
+        | "engine.rules_dump"
+        | "engine.config_dump" => {
             Some("read")
         }
-        "proxy.start" | "proxy.stop" => Some("control"),
+        "proxy.start" | "proxy.stop" | "system.shutdown" => Some("control"),
         "engine.set_listen_addr"
         | "engine.load_ca"
         | "engine.set_inspect_enabled"
@@ -811,7 +1161,11 @@ fn required_scope(method: &str) -> Option<&'static str> {
         | "engine.rules_add_map_local_file"
         | "engine.rules_add_map_local_text"
         | "engine.rules_add_map_remote"
-        | "engine.rules_add_status_rewrite" => Some("rules.write"),
+        | "engine.rules_add_status_rewrite"
+        | "engine.rules_remove_allow"
+        | "engine.rules_remove_map_local"
+        | "engine.rules_remove_map_remote"
+        | "engine.rules_remove_status_rewrite" => Some("rules.write"),
         "system.rotate_token" => Some("admin"),
         _ => None,
     }
@@ -995,6 +1349,28 @@ async fn stop_proxy(state: &Arc<Mutex<DaemonState>>) -> std::result::Result<Valu
     }
 
     Ok(json!({"status": "stopped"}))
+}
+
+async fn shutdown_daemon(
+    state: &Arc<Mutex<DaemonState>>,
+    daemon_shutdown_tx: &watch::Sender<bool>,
+) -> std::result::Result<Value, (i32, String)> {
+    let stop_result = tokio::time::timeout(Duration::from_secs(2), stop_proxy(state)).await;
+    let stop_note = match stop_result {
+        Ok(Ok(_)) => None,
+        Ok(Err((_, message))) => Some(format!("proxy stop failed: {message}")),
+        Err(_) => Some("proxy stop timed out".to_string()),
+    };
+
+    if daemon_shutdown_tx.send(true).is_err() {
+        return Err((IO_ERROR, "failed to signal daemon shutdown".to_string()));
+    }
+
+    if let Some(note) = stop_note {
+        Ok(json!({"status": "shutting_down", "note": note}))
+    } else {
+        Ok(json!({"status": "shutting_down"}))
+    }
 }
 
 fn verify_principal(peer_pid: u32) -> Result<String> {
