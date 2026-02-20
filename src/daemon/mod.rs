@@ -178,9 +178,18 @@ impl AuthManager {
             jti: Uuid::new_v4().to_string(),
         };
 
-        write_private_file(&self.paths.app_token_path, self.encode_token(&app).as_bytes())?;
-        write_private_file(&self.paths.cli_token_path, self.encode_token(&cli).as_bytes())?;
-        write_private_file(&self.paths.mcp_token_path, self.encode_token(&mcp).as_bytes())?;
+        write_private_file(
+            &self.paths.app_token_path,
+            self.encode_token(&app).as_bytes(),
+        )?;
+        write_private_file(
+            &self.paths.cli_token_path,
+            self.encode_token(&cli).as_bytes(),
+        )?;
+        write_private_file(
+            &self.paths.mcp_token_path,
+            self.encode_token(&mcp).as_bytes(),
+        )?;
 
         Ok(())
     }
@@ -387,7 +396,9 @@ async fn handle_connection(
     auth: AuthManager,
     daemon_shutdown_tx: watch::Sender<bool>,
 ) -> Result<()> {
-    let peer = stream.peer_cred().context("failed to read peer credentials")?;
+    let peer = stream
+        .peer_cred()
+        .context("failed to read peer credentials")?;
     let peer_uid = peer.uid();
     let peer_pid = peer.pid();
 
@@ -418,7 +429,8 @@ async fn handle_connection(
         let req: RpcRequest = match serde_json::from_str(trimmed) {
             Ok(req) => req,
             Err(err) => {
-                let response = RpcResponse::failure(None, INVALID_PARAMS, format!("invalid JSON: {err}"));
+                let response =
+                    RpcResponse::failure(None, INVALID_PARAMS, format!("invalid JSON: {err}"));
                 write_json_line(&mut write_half, &response).await?;
                 continue;
             }
@@ -486,7 +498,9 @@ async fn dispatch_request(
 
     let result = match req.method.as_str() {
         "system.ping" => Ok(json!({"pong": true})),
-        "system.version" => Ok(json!({"engine": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION})),
+        "system.version" => {
+            Ok(json!({"engine": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION}))
+        }
         "system.rotate_token" => {
             if let Err(err) = auth.rotate_tokens() {
                 Err((IO_ERROR, format!("failed to rotate token: {err:#}")))
@@ -512,7 +526,10 @@ async fn dispatch_request(
             }
             let mut guard = state.lock().await;
             if guard.running {
-                Err((STATE_ERROR, "cannot change listen_addr while running".to_string()))
+                Err((
+                    STATE_ERROR,
+                    "cannot change listen_addr while running".to_string(),
+                ))
             } else {
                 guard.config.listen_addr = listen.to_string();
                 Ok(json!({"ok": true}))
@@ -547,7 +564,10 @@ async fn dispatch_request(
                 .ok_or_else(|| (INVALID_PARAMS, "enabled is required".to_string()))?;
             let mut guard = state.lock().await;
             if guard.running {
-                Err((STATE_ERROR, "cannot change inspect while running".to_string()))
+                Err((
+                    STATE_ERROR,
+                    "cannot change inspect while running".to_string(),
+                ))
             } else {
                 guard.config.inspect.enabled = enabled;
                 Ok(json!({"ok": true}))
@@ -563,7 +583,10 @@ async fn dispatch_request(
                 .unwrap_or(8889);
             let mut guard = state.lock().await;
             if guard.running {
-                Err((STATE_ERROR, "cannot change transparent mode while running".to_string()))
+                Err((
+                    STATE_ERROR,
+                    "cannot change transparent mode while running".to_string(),
+                ))
             } else {
                 guard.config.transparent.enabled = enabled;
                 guard.config.transparent.listen_port = port;
@@ -585,7 +608,10 @@ async fn dispatch_request(
 
             let mut guard = state.lock().await;
             if guard.running {
-                Err((STATE_ERROR, "cannot change allowlist while running".to_string()))
+                Err((
+                    STATE_ERROR,
+                    "cannot change allowlist while running".to_string(),
+                ))
             } else {
                 guard.config.client_access.enforce_allowlist = enabled;
                 guard.config.client_access.allowed_client_ips = parsed;
@@ -617,7 +643,10 @@ async fn dispatch_request(
 
             let mut guard = state.lock().await;
             if guard.running {
-                Err((STATE_ERROR, "cannot change throttle while running".to_string()))
+                Err((
+                    STATE_ERROR,
+                    "cannot change throttle while running".to_string(),
+                ))
             } else {
                 guard.config.throttle.enabled = enabled;
                 guard.config.throttle.latency_ms = latency_ms;
@@ -791,7 +820,7 @@ async fn dispatch_request(
                     return Err((
                         INVALID_PARAMS,
                         "status_code must be valid HTTP status".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -833,7 +862,7 @@ async fn dispatch_request(
                     return Err((
                         INVALID_PARAMS,
                         "status_code must be valid HTTP status".to_string(),
-                    ))
+                    ));
                 }
             };
 
@@ -886,7 +915,7 @@ async fn dispatch_request(
                     return Err((
                         INVALID_PARAMS,
                         "to_status_code must be valid HTTP status".to_string(),
-                    ))
+                    ));
                 }
             };
             let from = if from_status_raw < 0 {
@@ -898,7 +927,7 @@ async fn dispatch_request(
                         return Err((
                             INVALID_PARAMS,
                             "from_status_code must be -1 or valid HTTP status".to_string(),
-                        ))
+                        ));
                     }
                 }
             };
@@ -1038,39 +1067,37 @@ async fn dispatch_request(
                 return Err((INVALID_PARAMS, "matcher is required".to_string()));
             }
 
-            let from_filter = match param_as_i64(&params, "from_status_code")
-                .map_err(|e| (INVALID_PARAMS, e))?
-            {
-                None => None,
-                Some(raw) if raw < 0 => Some(None),
-                Some(raw) => {
-                    let status = match http::StatusCode::from_u16(raw as u16) {
-                        Ok(status) => status,
+            let from_filter =
+                match param_as_i64(&params, "from_status_code").map_err(|e| (INVALID_PARAMS, e))? {
+                    None => None,
+                    Some(raw) if raw < 0 => Some(None),
+                    Some(raw) => {
+                        let status = match http::StatusCode::from_u16(raw as u16) {
+                            Ok(status) => status,
+                            Err(_) => {
+                                return Err((
+                                    INVALID_PARAMS,
+                                    "from_status_code must be -1 or valid HTTP status".to_string(),
+                                ));
+                            }
+                        };
+                        Some(Some(status))
+                    }
+                };
+
+            let to_filter =
+                match param_as_u64(&params, "to_status_code").map_err(|e| (INVALID_PARAMS, e))? {
+                    None => None,
+                    Some(raw) => match http::StatusCode::from_u16(raw as u16) {
+                        Ok(status) => Some(status),
                         Err(_) => {
                             return Err((
                                 INVALID_PARAMS,
-                                "from_status_code must be -1 or valid HTTP status".to_string(),
+                                "to_status_code must be valid HTTP status".to_string(),
                             ));
                         }
-                    };
-                    Some(Some(status))
-                }
-            };
-
-            let to_filter = match param_as_u64(&params, "to_status_code")
-                .map_err(|e| (INVALID_PARAMS, e))?
-            {
-                None => None,
-                Some(raw) => match http::StatusCode::from_u16(raw as u16) {
-                    Ok(status) => Some(status),
-                    Err(_) => {
-                        return Err((
-                            INVALID_PARAMS,
-                            "to_status_code must be valid HTTP status".to_string(),
-                        ));
-                    }
-                },
-            };
+                    },
+                };
 
             let mut guard = state.lock().await;
             if guard.running {
@@ -1117,7 +1144,8 @@ async fn dispatch_request(
                 .collect::<Vec<_>>();
             let next_seq = records.last().map(|record| record.seq).unwrap_or(after_seq);
 
-            Ok(serde_json::to_value(LogsTailResult { next_seq, records }).expect("serialize logs.tail"))
+            Ok(serde_json::to_value(LogsTailResult { next_seq, records })
+                .expect("serialize logs.tail"))
         }
         "daemon.doctor" => {
             let guard = state.lock().await;
@@ -1140,15 +1168,8 @@ async fn dispatch_request(
 fn required_scope(method: &str) -> Option<&'static str> {
     match method {
         "system.handshake" => None,
-        "system.ping"
-        | "system.version"
-        | "proxy.status"
-        | "logs.tail"
-        | "daemon.doctor"
-        | "engine.rules_dump"
-        | "engine.config_dump" => {
-            Some("read")
-        }
+        "system.ping" | "system.version" | "proxy.status" | "logs.tail" | "daemon.doctor"
+        | "engine.rules_dump" | "engine.config_dump" => Some("read"),
         "proxy.start" | "proxy.stop" | "system.shutdown" => Some("control"),
         "engine.set_listen_addr"
         | "engine.load_ca"
@@ -1250,9 +1271,13 @@ async fn start_proxy(state: &Arc<Mutex<DaemonState>>) -> std::result::Result<Val
 
     let ca = match (&config.ca_cert_path, &config.ca_key_path) {
         (Some(cert), Some(key)) => {
-            match CertificateAuthority::from_pem_files(cert, key)
-                .with_context(|| format!("failed to load CA cert={} key={}", cert.display(), key.display()))
-            {
+            match CertificateAuthority::from_pem_files(cert, key).with_context(|| {
+                format!(
+                    "failed to load CA cert={} key={}",
+                    cert.display(),
+                    key.display()
+                )
+            }) {
                 Ok(ca) => Some(Arc::new(ca)),
                 Err(err) => return Err((IO_ERROR, err.to_string())),
             }
@@ -1386,8 +1411,14 @@ fn verify_principal(peer_pid: u32) -> Result<String> {
 
     let identifier = match codesign_identifier(&binary_path) {
         Ok(identifier) => identifier,
-        Err(err) => return Err(err)
-            .with_context(|| format!("failed to inspect code signature: {}", binary_path.display())),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect code signature: {}",
+                    binary_path.display()
+                )
+            });
+        }
     };
 
     let principal = match identifier.as_str() {

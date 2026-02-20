@@ -9,7 +9,9 @@ use tokio::sync::watch;
 
 use crate::ca::{self, CaKeyAlgorithm, CertificateAuthority};
 use crate::proxy::{self, ClientAccessConfig, InspectConfig, ThrottleConfig, TransparentConfig};
-use crate::rules::{AllowRule, MapLocalRule, MapRemoteRule, MapSource, Matcher, Rules, StatusRewriteRule};
+use crate::rules::{
+    AllowRule, MapLocalRule, MapRemoteRule, MapSource, Matcher, Rules, StatusRewriteRule,
+};
 
 const CRAB_OK: i32 = 0;
 const CRAB_ERR_INVALID_ARG: i32 = 1;
@@ -1346,8 +1348,10 @@ mod tests {
     fn ffi_client_allowlist_rejects_invalid_ip_literal() {
         let handle = create_handle(None);
         let ip = CString::new("not-an-ip").expect("cstring");
-        let (code, message) =
-            crab_result_to_owned(crab_proxy_client_allowlist_add_ip(handle.raw(), ip.as_ptr()));
+        let (code, message) = crab_result_to_owned(crab_proxy_client_allowlist_add_ip(
+            handle.raw(),
+            ip.as_ptr(),
+        ));
         assert_eq!(code, CRAB_ERR_INVALID_ARG);
         assert!(message.contains("IPv4 or IPv6"));
     }

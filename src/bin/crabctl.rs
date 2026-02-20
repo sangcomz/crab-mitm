@@ -113,34 +113,52 @@ async fn main() -> Result<()> {
         Command::Rpc(args) => {
             let params: Value = serde_json::from_str(&args.params)
                 .with_context(|| format!("invalid params JSON: {}", args.params))?;
+            let result =
+                send_rpc(&socket_path, &token, &cli.principal, &args.method, params).await?;
+            print_json(&result, args.compact)?;
+        }
+        Command::Ping => {
             let result = send_rpc(
                 &socket_path,
                 &token,
                 &cli.principal,
-                &args.method,
-                params,
+                "system.ping",
+                json!({}),
             )
             .await?;
-            print_json(&result, args.compact)?;
-        }
-        Command::Ping => {
-            let result = send_rpc(&socket_path, &token, &cli.principal, "system.ping", json!({}))
-                .await?;
             print_json(&result, false)?;
         }
         Command::Start => {
-            let result = send_rpc(&socket_path, &token, &cli.principal, "proxy.start", json!({}))
-                .await?;
+            let result = send_rpc(
+                &socket_path,
+                &token,
+                &cli.principal,
+                "proxy.start",
+                json!({}),
+            )
+            .await?;
             print_json(&result, false)?;
         }
         Command::Stop => {
-            let result = send_rpc(&socket_path, &token, &cli.principal, "proxy.stop", json!({}))
-                .await?;
+            let result = send_rpc(
+                &socket_path,
+                &token,
+                &cli.principal,
+                "proxy.stop",
+                json!({}),
+            )
+            .await?;
             print_json(&result, false)?;
         }
         Command::Status => {
-            let result = send_rpc(&socket_path, &token, &cli.principal, "proxy.status", json!({}))
-                .await?;
+            let result = send_rpc(
+                &socket_path,
+                &token,
+                &cli.principal,
+                "proxy.status",
+                json!({}),
+            )
+            .await?;
             print_json(&result, false)?;
         }
         Command::RotateToken => {

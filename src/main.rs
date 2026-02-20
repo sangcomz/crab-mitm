@@ -164,7 +164,16 @@ async fn main() -> Result<()> {
                 );
             }
 
-            proxy::run(&args.listen, ca, rules, inspect, throttle, client_access, None).await
+            proxy::run(
+                &args.listen,
+                ca,
+                rules,
+                inspect,
+                throttle,
+                client_access,
+                None,
+            )
+            .await
         }
     }
 }

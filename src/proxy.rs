@@ -5,8 +5,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::{OnceLock, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -368,9 +368,7 @@ pub async fn run_with_shutdown(
     Ok(())
 }
 
-fn notify_startup_ready(
-    ready_tx: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
-) {
+fn notify_startup_ready(ready_tx: &mut Option<oneshot::Sender<std::result::Result<(), String>>>) {
     if let Some(tx) = ready_tx.take() {
         let _ = tx.send(Ok(()));
     }
@@ -429,19 +427,19 @@ async fn accept_transparent(
 
 fn build_client() -> Result<HttpClient> {
     let mut root_store = RootCertStore::empty();
-    
+
     let roots = rustls_native_certs::load_native_certs();
-    
+
     if let Some(err) = roots.errors.first() {
         tracing::warn!(error = %err, "error loading some native root certificates");
     }
-    
+
     for cert in roots.certs {
         if let Err(err) = root_store.add(cert) {
             tracing::warn!(error = %err, "skipping invalid native root certificate");
         }
     }
-    
+
     if root_store.is_empty() {
         tracing::error!("no valid root certificates loaded — upstream TLS will fail");
     }
@@ -948,10 +946,7 @@ fn upstream_request_timeout() -> Duration {
 }
 
 fn max_connections() -> usize {
-    parse_env_u64(
-        std::env::var("CRAB_MAX_CONNECTIONS").ok().as_deref(),
-        4096,
-    ) as usize
+    parse_env_u64(std::env::var("CRAB_MAX_CONNECTIONS").ok().as_deref(), 4096) as usize
 }
 
 fn upstream_san_sniff_enabled() -> bool {
@@ -1576,8 +1571,11 @@ async fn proxy_http(
 
     let timeout = upstream_request_timeout();
     let upstream_resp = if state.transparent {
-        match tokio::time::timeout(timeout, transparent_upstream_request(out_req, &upstream_target))
-            .await
+        match tokio::time::timeout(
+            timeout,
+            transparent_upstream_request(out_req, &upstream_target),
+        )
+        .await
         {
             Ok(result) => result?,
             Err(_) => {
@@ -1816,7 +1814,9 @@ fn rewrite_map_remote_target(
     let suffix = if matcher.starts_with("http://") || matcher.starts_with("https://") {
         let full = resolved_target_url(original);
         full.strip_prefix(matcher)
-            .ok_or_else(|| anyhow::anyhow!("source URL does not match map_remote prefix '{}'", matcher))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("source URL does not match map_remote prefix '{}'", matcher)
+            })?
             .to_string()
     } else if matcher.starts_with('/') {
         original_path_and_query
@@ -1827,7 +1827,9 @@ fn rewrite_map_remote_target(
         let authority_and_path = format!("{}{}", original.authority, original_path_and_query);
         authority_and_path
             .strip_prefix(matcher)
-            .ok_or_else(|| anyhow::anyhow!("source authority/path does not match map_remote prefix"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("source authority/path does not match map_remote prefix")
+            })?
             .to_string()
     };
 
@@ -2082,8 +2084,8 @@ fn emit_structured_log(payload: serde_json::Value) {
 mod tests {
     use std::fs;
 
-    use base64::Engine as _;
     use crate::rules::Matcher;
+    use base64::Engine as _;
 
     use super::*;
 
