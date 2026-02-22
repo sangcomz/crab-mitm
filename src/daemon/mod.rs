@@ -1147,6 +1147,17 @@ async fn dispatch_request(
             Ok(serde_json::to_value(LogsTailResult { next_seq, records })
                 .expect("serialize logs.tail"))
         }
+        "logs.clear" => {
+            let mut guard = state.lock().await;
+            let cleared = guard.logs.len();
+            guard.logs.clear();
+            let next_seq = guard.next_log_seq.saturating_sub(1);
+            Ok(json!({
+                "ok": true,
+                "cleared": cleared,
+                "next_seq": next_seq,
+            }))
+        }
         "daemon.doctor" => {
             let guard = state.lock().await;
             Ok(json!({
@@ -1170,7 +1181,7 @@ fn required_scope(method: &str) -> Option<&'static str> {
         "system.handshake" => None,
         "system.ping" | "system.version" | "proxy.status" | "logs.tail" | "daemon.doctor"
         | "engine.rules_dump" | "engine.config_dump" => Some("read"),
-        "proxy.start" | "proxy.stop" | "system.shutdown" => Some("control"),
+        "proxy.start" | "proxy.stop" | "system.shutdown" | "logs.clear" => Some("control"),
         "engine.set_listen_addr"
         | "engine.load_ca"
         | "engine.set_inspect_enabled"

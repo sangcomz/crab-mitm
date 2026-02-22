@@ -230,7 +230,20 @@ fn starts_with_full_url(scheme: &str, authority: &str, path_and_query: &str, raw
     if !scheme.eq_ignore_ascii_case(raw_scheme) {
         return false;
     }
-    starts_with_authority_and_path(authority, path_and_query, remainder)
+
+    let (pattern_authority, pattern_path_prefix) = match remainder.split_once('/') {
+        Some((authority, path)) => (authority, Some(format!("/{}", path))),
+        None => (remainder, None),
+    };
+
+    if pattern_authority.is_empty() || !matches_authority_pattern(authority, pattern_authority) {
+        return false;
+    }
+
+    match pattern_path_prefix {
+        Some(prefix) => path_and_query.starts_with(&prefix),
+        None => true,
+    }
 }
 
 fn starts_with_authority_and_path(authority: &str, path_and_query: &str, prefix: &str) -> bool {
@@ -342,6 +355,17 @@ mod tests {
         let m = Matcher::new("https://example.com/api");
         assert!(m.is_match("https", "example.com", "/api/v1"));
         assert!(!m.is_match("https", "example.com", "/health"));
+    }
+
+    #[test]
+    fn matcher_supports_full_url_prefix_when_authority_has_port() {
+        let m = Matcher::new("https://example.com/api");
+        assert!(m.is_match("https", "example.com:443", "/api/v1"));
+        assert!(m.is_match("https", "example.com:444", "/api/v1"));
+
+        let with_explicit_port = Matcher::new("https://example.com:443/api");
+        assert!(with_explicit_port.is_match("https", "example.com:443", "/api/v1"));
+        assert!(!with_explicit_port.is_match("https", "example.com:444", "/api/v1"));
     }
 
     #[test]

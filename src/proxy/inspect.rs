@@ -17,7 +17,7 @@ use pin_project::pin_project;
 use pin_project::pinned_drop;
 use serde_json::json;
 
-use super::{InspectConfig, ProxyBody, boxed_body, parse_env_bool};
+use super::{InspectConfig, ProxyBody, boxed_body, emit_structured_log, parse_env_bool};
 
 static NEXT_SPOOL_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -268,23 +268,20 @@ impl BodyInspector {
             error = %error.as_deref().unwrap_or("-"),
             "body inspection"
         );
-        tracing::info!(
-            "CRAB_JSON {}",
-            json!({
-                "type": "meta",
-                "event": "body_inspection",
-                "request_id": self.meta.request_id.as_ref(),
-                "peer": self.meta.peer.to_string(),
-                "method": self.meta.method.as_ref(),
-                "url": self.meta.url.as_ref(),
-                "direction": self.meta.direction,
-                "response_status": self.meta.response_status.map(|status| status.as_u16()),
-                "body_bytes": self.total_bytes,
-                "sample_b64": sample_b64,
-                "outcome": outcome,
-                "error": error
-            })
-        );
+        emit_structured_log(json!({
+            "type": "meta",
+            "event": "body_inspection",
+            "request_id": self.meta.request_id.as_ref(),
+            "peer": self.meta.peer.to_string(),
+            "method": self.meta.method.as_ref(),
+            "url": self.meta.url.as_ref(),
+            "direction": self.meta.direction,
+            "response_status": self.meta.response_status.map(|status| status.as_u16()),
+            "body_bytes": self.total_bytes,
+            "sample_b64": sample_b64,
+            "outcome": outcome,
+            "error": error
+        }));
     }
 }
 

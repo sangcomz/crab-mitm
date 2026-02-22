@@ -1812,12 +1812,31 @@ fn rewrite_map_remote_target(
 ) -> Result<ResolvedTarget> {
     let matcher = rule.matcher.raw().trim();
     let suffix = if matcher.starts_with("http://") || matcher.starts_with("https://") {
-        let full = resolved_target_url(original);
-        full.strip_prefix(matcher)
-            .ok_or_else(|| {
-                anyhow::anyhow!("source URL does not match map_remote prefix '{}'", matcher)
-            })?
-            .to_string()
+        if !rule
+            .matcher
+            .is_match(&original.scheme, &original.authority, original_path_and_query)
+        {
+            anyhow::bail!("source URL does not match map_remote prefix '{}'", matcher);
+        }
+
+        let (_, remainder) = matcher
+            .split_once("://")
+            .ok_or_else(|| anyhow::anyhow!("invalid map_remote full URL matcher"))?;
+        match remainder.split_once('/') {
+            Some((_, path_prefix_without_slash)) => {
+                let path_prefix = format!("/{path_prefix_without_slash}");
+                original_path_and_query
+                    .strip_prefix(&path_prefix)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "source path does not match map_remote full URL prefix '{}'",
+                            matcher
+                        )
+                    })?
+                    .to_string()
+            }
+            None => original_path_and_query.to_string(),
+        }
     } else if matcher.starts_with('/') {
         original_path_and_query
             .strip_prefix(matcher)
@@ -2334,6 +2353,28 @@ mod tests {
         assert_eq!(
             resolved_target_url(&rewritten),
             "https://staging.example.com/v2/users?id=1"
+        );
+    }
+
+    #[test]
+    fn rewrite_map_remote_target_rewrites_full_url_prefix_with_default_https_port_authority() {
+        let original = ResolvedTarget {
+            scheme: "https".to_string(),
+            authority: "httpbin.org:443".to_string(),
+            uri: "https://httpbin.org:443/anything/users?id=1"
+                .parse()
+                .expect("original uri"),
+        };
+        let rule = crate::rules::MapRemoteRule {
+            matcher: Matcher::new("https://httpbin.org/anything"),
+            destination: "https://staging.example.com/mock".to_string(),
+        };
+
+        let rewritten = rewrite_map_remote_target(&original, "/anything/users?id=1", &rule)
+            .expect("rewrite map_remote target");
+        assert_eq!(
+            resolved_target_url(&rewritten),
+            "https://staging.example.com/mock/users?id=1"
         );
     }
 
