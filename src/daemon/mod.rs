@@ -1,5 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::ffi::CStr;
+use std::io::ErrorKind;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -97,13 +99,29 @@ impl RunPaths {
         }
 
         if self.socket_path.exists() {
-            match std::fs::remove_file(&self.socket_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            match existing_unix_socket_state(&self.socket_path) {
+                Ok(ExistingSocketState::Active) => {
+                    anyhow::bail!(
+                        "daemon socket already active: {}",
+                        self.socket_path.display()
+                    );
+                }
+                Ok(ExistingSocketState::Stale) => match std::fs::remove_file(&self.socket_path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "failed to remove stale socket: {}",
+                                self.socket_path.display()
+                            )
+                        });
+                    }
+                },
                 Err(err) => {
                     return Err(err).with_context(|| {
                         format!(
-                            "failed to remove stale socket: {}",
+                            "failed to inspect existing daemon socket: {}",
                             self.socket_path.display()
                         )
                     });
@@ -112,6 +130,30 @@ impl RunPaths {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingSocketState {
+    Active,
+    Stale,
+}
+
+fn existing_unix_socket_state(path: &Path) -> std::io::Result<ExistingSocketState> {
+    match StdUnixStream::connect(path) {
+        Ok(stream) => {
+            drop(stream);
+            Ok(ExistingSocketState::Active)
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) =>
+        {
+            Ok(ExistingSocketState::Stale)
+        }
+        Err(err) => Err(err),
     }
 }
 
