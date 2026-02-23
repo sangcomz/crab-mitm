@@ -527,9 +527,12 @@ async fn dispatch_request(
         ));
     }
 
-    if let Some(scope) = required_scope(&req.method)
-        && !active.scopes.contains(scope)
-    {
+    // Fail closed: if a post-handshake method is missing from the scope map,
+    // treat it as unknown instead of accidentally skipping authorization.
+    let Some(scope) = required_scope_for_authenticated_method(&req.method) else {
+        return Err((METHOD_NOT_FOUND, format!("unknown method: {}", req.method)));
+    };
+    if !active.scopes.contains(scope) {
         return Err((PERMISSION_DENIED, format!("scope '{scope}' required")));
     }
 
@@ -1218,9 +1221,8 @@ async fn dispatch_request(
     result
 }
 
-fn required_scope(method: &str) -> Option<&'static str> {
+fn required_scope_for_authenticated_method(method: &str) -> Option<&'static str> {
     match method {
-        "system.handshake" => None,
         "system.ping" | "system.version" | "proxy.status" | "logs.tail" | "daemon.doctor"
         | "engine.rules_dump" | "engine.config_dump" => Some("read"),
         "proxy.start" | "proxy.stop" | "system.shutdown" | "logs.clear" => Some("control"),
@@ -1242,6 +1244,104 @@ fn required_scope(method: &str) -> Option<&'static str> {
         | "engine.rules_remove_status_rewrite" => Some("rules.write"),
         "system.rotate_token" => Some("admin"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::Value;
+    use tokio::sync::watch;
+
+    fn test_auth_manager() -> AuthManager {
+        let root = std::env::temp_dir().join(format!("crab-mitm-daemon-test-{}", Uuid::new_v4()));
+        let paths = RunPaths {
+            run_dir: root.clone(),
+            socket_path: root.join("crabd.sock"),
+            app_token_path: root.join("app.token"),
+            cli_token_path: root.join("cli.token"),
+            mcp_token_path: root.join("mcp.token"),
+        };
+        AuthManager::new(paths)
+    }
+
+    fn test_session(scopes: &[&str]) -> Option<Session> {
+        Some(Session {
+            id: "test-session".to_string(),
+            principal: "app".to_string(),
+            scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+            epoch: 1,
+        })
+    }
+
+    fn test_request(method: &str) -> RpcRequest {
+        RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: method.to_string(),
+            params: Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_request_unknown_method_fails_closed_after_handshake() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let auth = test_auth_manager();
+        let mut session = test_session(&["read", "control", "rules.write", "admin"]);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+
+        let err = dispatch_request(
+            &test_request("engine.set_brand_new_thing"),
+            &state,
+            &auth,
+            &mut session,
+            None,
+            &shutdown_tx,
+        )
+        .await
+        .expect_err("unknown method should fail");
+
+        assert_eq!(err.0, METHOD_NOT_FOUND);
+        assert!(err.1.contains("unknown method"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_request_known_method_still_checks_scope() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let auth = test_auth_manager();
+        let mut session = test_session(&[]);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+
+        let err = dispatch_request(
+            &test_request("system.ping"),
+            &state,
+            &auth,
+            &mut session,
+            None,
+            &shutdown_tx,
+        )
+        .await
+        .expect_err("missing read scope should fail");
+
+        assert_eq!(err.0, PERMISSION_DENIED);
+        assert!(err.1.contains("read"));
+    }
+
+    #[test]
+    fn scope_lookup_excludes_handshake_and_unknown_methods() {
+        assert_eq!(
+            required_scope_for_authenticated_method("system.ping"),
+            Some("read")
+        );
+        assert_eq!(
+            required_scope_for_authenticated_method("system.handshake"),
+            None
+        );
+        assert_eq!(
+            required_scope_for_authenticated_method("system.not_real"),
+            None
+        );
     }
 }
 
