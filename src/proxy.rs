@@ -1812,10 +1812,11 @@ fn rewrite_map_remote_target(
 ) -> Result<ResolvedTarget> {
     let matcher = rule.matcher.raw().trim();
     let suffix = if matcher.starts_with("http://") || matcher.starts_with("https://") {
-        if !rule
-            .matcher
-            .is_match(&original.scheme, &original.authority, original_path_and_query)
-        {
+        if !rule.matcher.is_match(
+            &original.scheme,
+            &original.authority,
+            original_path_and_query,
+        ) {
             anyhow::bail!("source URL does not match map_remote prefix '{}'", matcher);
         }
 

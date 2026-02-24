@@ -919,7 +919,7 @@ fn initialize_result() -> Value {
             "name": "crab-mcp",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Use Crab tools to inspect status/logs/traffic and manage proxy runtime, engine config, and map/allow/rewrite rules."
+        "instructions": "Use Crab tools to inspect status/logs/traffic and manage capture recording, engine config, and map/allow/rewrite rules."
     })
 }
 
@@ -944,8 +944,8 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "crab_proxy_status",
-            "description": "Get proxy runtime status.",
+            "name": "crab_capture_status",
+            "description": "Get traffic recording (capture) status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -953,8 +953,8 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "crab_proxy_start",
-            "description": "Start proxy runtime.",
+            "name": "crab_capture_start",
+            "description": "Start traffic recording (capture).",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -962,8 +962,8 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "crab_proxy_stop",
-            "description": "Stop proxy runtime.",
+            "name": "crab_capture_stop",
+            "description": "Stop traffic recording (capture).",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -1347,9 +1347,9 @@ async fn call_tool(
     match tool_name {
         "crab_ping" => bridge.call("system.ping", json!({})).await,
         "crab_version" => bridge.call("system.version", json!({})).await,
-        "crab_proxy_status" => bridge.call("proxy.status", json!({})).await,
-        "crab_proxy_start" => bridge.call("proxy.start", json!({})).await,
-        "crab_proxy_stop" => bridge.call("proxy.stop", json!({})).await,
+        "crab_capture_status" => bridge.call("capture.status", json!({})).await,
+        "crab_capture_start" => bridge.call("capture.start", json!({})).await,
+        "crab_capture_stop" => bridge.call("capture.stop", json!({})).await,
         "crab_daemon_doctor" => bridge.call("daemon.doctor", json!({})).await,
         "crab_engine_config_get" => bridge.call("engine.config_dump", json!({})).await,
         "crab_engine_set_listen_addr" => {

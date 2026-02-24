@@ -330,6 +330,7 @@ struct DaemonState {
     config: RuntimeConfig,
     rules: Rules,
     running: bool,
+    capture_enabled: bool,
     shutdown_tx: Option<watch::Sender<bool>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     logs: VecDeque<LogRecord>,
@@ -343,6 +344,7 @@ impl DaemonState {
             config: RuntimeConfig::default(),
             rules: Rules::default(),
             running: false,
+            capture_enabled: true,
             shutdown_tx: None,
             task: None,
             logs: VecDeque::new(),
@@ -389,7 +391,9 @@ pub async fn run_forever(options: DaemonOptions) -> Result<()> {
     tokio::spawn(async move {
         while let Some(line) = log_rx.recv().await {
             let mut guard = state_for_logs.lock().await;
-            guard.push_log(2, line);
+            if guard.capture_enabled {
+                guard.push_log(2, line);
+            }
         }
     });
 
@@ -561,6 +565,12 @@ async fn dispatch_request(
         "proxy.status" => {
             let running = state.lock().await.running;
             Ok(json!({"status": if running {"running"} else {"stopped"}}))
+        }
+        "capture.start" => set_capture_enabled(state, true).await,
+        "capture.stop" => set_capture_enabled(state, false).await,
+        "capture.status" => {
+            let capture_enabled = state.lock().await.capture_enabled;
+            Ok(json!({"status": if capture_enabled {"running"} else {"stopped"}}))
         }
         "engine.set_listen_addr" => {
             let listen = param_as_str(&params, "listen_addr")
@@ -1213,6 +1223,7 @@ async fn dispatch_request(
                 "launch_agent": "unmanaged",
                 "principal_verification": "enabled",
                 "running": guard.running,
+                "capture": if guard.capture_enabled { "running" } else { "stopped" },
             }))
         }
         _ => Err((METHOD_NOT_FOUND, format!("unknown method: {}", req.method))),
@@ -1223,9 +1234,10 @@ async fn dispatch_request(
 
 fn required_scope_for_authenticated_method(method: &str) -> Option<&'static str> {
     match method {
-        "system.ping" | "system.version" | "proxy.status" | "logs.tail" | "daemon.doctor"
-        | "engine.rules_dump" | "engine.config_dump" => Some("read"),
-        "proxy.start" | "proxy.stop" | "system.shutdown" | "logs.clear" => Some("control"),
+        "system.ping" | "system.version" | "proxy.status" | "capture.status" | "logs.tail"
+        | "daemon.doctor" | "engine.rules_dump" | "engine.config_dump" => Some("read"),
+        "proxy.start" | "proxy.stop" | "capture.start" | "capture.stop" | "system.shutdown"
+        | "logs.clear" => Some("control"),
         "engine.set_listen_addr"
         | "engine.load_ca"
         | "engine.set_inspect_enabled"
@@ -1502,6 +1514,15 @@ async fn start_proxy(state: &Arc<Mutex<DaemonState>>) -> std::result::Result<Val
             Err((IO_ERROR, details))
         }
     }
+}
+
+async fn set_capture_enabled(
+    state: &Arc<Mutex<DaemonState>>,
+    enabled: bool,
+) -> std::result::Result<Value, (i32, String)> {
+    let mut guard = state.lock().await;
+    guard.capture_enabled = enabled;
+    Ok(json!({"status": if enabled {"running"} else {"stopped"}}))
 }
 
 async fn stop_proxy(state: &Arc<Mutex<DaemonState>>) -> std::result::Result<Value, (i32, String)> {
