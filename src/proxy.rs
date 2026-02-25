@@ -30,6 +30,7 @@ use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::io::ReaderStream;
 use x509_parser::extensions::GeneralName;
@@ -136,6 +137,7 @@ struct ProxyState {
     inspect: Arc<InspectConfig>,
     throttle: Arc<ThrottleConfig>,
     plugin: Option<Arc<PluginRuntime>>,
+    shutdown: watch::Receiver<bool>,
     transparent: bool,
 }
 
@@ -297,6 +299,7 @@ pub async fn run_with_shutdown(
         inspect: inspect.clone(),
         throttle: throttle.clone(),
         plugin: plugin.clone(),
+        shutdown: shutdown_rx.clone(),
         transparent: false,
     };
     let transparent_state = ProxyState {
@@ -306,11 +309,13 @@ pub async fn run_with_shutdown(
         inspect,
         throttle,
         plugin,
+        shutdown: shutdown_rx.clone(),
         transparent: true,
     };
 
     let max_conn = max_connections();
     let semaphore = Arc::new(Semaphore::new(max_conn));
+    let mut conn_tasks = JoinSet::new();
     tracing::info!(
         listen = %listen,
         max_connections = max_conn,
@@ -330,7 +335,7 @@ pub async fn run_with_shutdown(
                 let permit = semaphore.clone().acquire_owned().await;
                 let Ok(permit) = permit else { break; };
                 let state = forward_state.clone();
-                tokio::spawn(async move {
+                conn_tasks.spawn(async move {
                     let _permit = permit;
                     if let Err(err) = serve_client(stream, peer, state).await {
                         tracing::debug!(peer = %peer, error = %err, "connection ended");
@@ -346,12 +351,17 @@ pub async fn run_with_shutdown(
                     let permit = semaphore.clone().acquire_owned().await;
                     let Ok(permit) = permit else { break; };
                     let state = transparent_state.clone();
-                    tokio::spawn(async move {
+                    conn_tasks.spawn(async move {
                         let _permit = permit;
                         if let Err(err) = serve_transparent_client(stream, peer, state).await {
                             tracing::debug!(peer = %peer, error = %err, "transparent connection ended");
                         }
                     });
+                }
+            }
+            joined = conn_tasks.join_next(), if !conn_tasks.is_empty() => {
+                if let Some(Err(err)) = joined {
+                    tracing::debug!(error = %err, "connection task join error");
                 }
             }
             changed = shutdown_rx.changed() => {
@@ -362,6 +372,15 @@ pub async fn run_with_shutdown(
                 }
                 break;
             }
+        }
+    }
+
+    conn_tasks.abort_all();
+    while let Some(joined) = conn_tasks.join_next().await {
+        if let Err(err) = joined
+            && !err.is_cancelled()
+        {
+            tracing::debug!(error = %err, "connection task join error during shutdown");
         }
     }
 
@@ -626,7 +645,9 @@ fn handle_connect(
     let inspect = state.inspect.clone();
     let throttle = state.throttle.clone();
     let plugin = state.plugin.clone();
-    let mitm_allowed = rules.is_mitm_allowed("https", &authority_str);
+    let mut shutdown_rx = state.shutdown.clone();
+    let mitm_allowed = rules.is_mitm_allowed("https", &authority_str)
+        || rules.has_https_intercept_rule(&authority_str);
     let should_mitm = ca.is_some() && mitm_allowed;
 
     if !should_mitm {
@@ -654,16 +675,44 @@ fn handle_connect(
     }
 
     tokio::spawn(async move {
-        match on_upgrade.await {
-            Ok(upgraded) => {
+        let upgraded = tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    tracing::debug!(peer = %peer, target = %authority_str, "CONNECT task cancelled on proxy shutdown before upgrade");
+                }
+                return;
+            }
+            upgraded = on_upgrade => {
+                match upgraded {
+                    Ok(upgraded) => upgraded,
+                    Err(err) => {
+                        tracing::warn!(peer = %peer, target = %authority_str, error = %err, "upgrade failed");
+                        return;
+                    }
+                }
+            }
+        };
+
+        let authority_str_for_tunnel = authority_str.clone();
+        let host_for_tunnel = host.clone();
+        let shutdown_for_tunnel = shutdown_rx.clone();
+        let authority_str_for_tunnel_logs = authority_str.clone();
+
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    tracing::debug!(peer = %peer, target = %authority_str, "CONNECT tunnel cancelled on proxy shutdown");
+                }
+            }
+            _ = async move {
                 if let Some(ca) = ca
                     && mitm_allowed
                 {
                     if let Err(err) = mitm_https(
                         upgraded,
                         peer,
-                        &authority_str,
-                        &host,
+                        &authority_str_for_tunnel,
+                        &host_for_tunnel,
                         port,
                         ca,
                         rules,
@@ -671,20 +720,25 @@ fn handle_connect(
                         inspect,
                         throttle,
                         plugin,
+                        shutdown_for_tunnel,
                     )
                     .await
                     {
-                        tracing::warn!(peer = %peer, target = %authority_str, error = %err, "MITM tunnel failed");
+                        tracing::warn!(peer = %peer, target = %authority_str_for_tunnel_logs, error = %err, "MITM tunnel failed");
                     }
                 } else if let Err(err) =
-                    tunnel_tcp(upgraded, &authority_str, &host, port, throttle.as_ref()).await
+                    tunnel_tcp(
+                        upgraded,
+                        &authority_str_for_tunnel,
+                        &host_for_tunnel,
+                        port,
+                        throttle.as_ref(),
+                    )
+                    .await
                 {
-                    tracing::warn!(peer = %peer, target = %authority_str, error = %err, "TCP tunnel failed");
+                    tracing::warn!(peer = %peer, target = %authority_str_for_tunnel_logs, error = %err, "TCP tunnel failed");
                 }
-            }
-            Err(err) => {
-                tracing::warn!(peer = %peer, target = %authority_str, error = %err, "upgrade failed");
-            }
+            } => {}
         }
     });
 
@@ -1136,6 +1190,7 @@ async fn mitm_https(
     inspect: Arc<InspectConfig>,
     throttle: Arc<ThrottleConfig>,
     plugin: Option<Arc<PluginRuntime>>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let upstream_sans = if upstream_san_sniff_enabled() {
         sniff_upstream_subject_names(host_for_cert, port_for_cert).await
@@ -1164,6 +1219,7 @@ async fn mitm_https(
         inspect,
         throttle,
         plugin,
+        shutdown,
         transparent: false,
     };
 

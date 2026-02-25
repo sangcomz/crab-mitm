@@ -202,6 +202,37 @@ impl Matcher {
         &self.raw
     }
 
+    pub fn is_ssl_proxy_match(&self, scheme: &str, authority: &str) -> bool {
+        let raw = self.raw.trim();
+        if raw.is_empty() {
+            return false;
+        }
+        if raw == "*" || raw == "*.*" {
+            return true;
+        }
+
+        let authority_pattern = if is_full_url_pattern(raw) {
+            let Some((raw_scheme, remainder)) = raw.split_once("://") else {
+                return false;
+            };
+            if !scheme.eq_ignore_ascii_case(raw_scheme) {
+                return false;
+            }
+            remainder.split('/').next().unwrap_or("")
+        } else {
+            if raw.starts_with('/') {
+                return false;
+            }
+            raw.split('/').next().unwrap_or(raw)
+        };
+
+        if authority_pattern.is_empty() {
+            return false;
+        }
+
+        matches_authority_pattern(authority, authority_pattern)
+    }
+
     pub fn is_match(&self, scheme: &str, authority: &str, path_and_query: &str) -> bool {
         let raw = self.raw.trim();
         if raw.is_empty() {
@@ -300,6 +331,20 @@ impl Rules {
         self.allowlist
             .iter()
             .any(|rule| rule.is_ssl_proxy_match(scheme, authority))
+    }
+
+    pub fn has_https_intercept_rule(&self, authority: &str) -> bool {
+        self.map_local
+            .iter()
+            .any(|rule| rule.matcher.is_ssl_proxy_match("https", authority))
+            || self
+                .map_remote
+                .iter()
+                .any(|rule| rule.matcher.is_ssl_proxy_match("https", authority))
+            || self
+                .status_rewrite
+                .iter()
+                .any(|rule| rule.matcher.is_ssl_proxy_match("https", authority))
     }
 
     pub fn find_map_local(
@@ -450,9 +495,41 @@ mod tests {
     }
 
     #[test]
+    fn matcher_ssl_proxy_match_supports_full_url_with_path() {
+        let matcher = Matcher::new("https://httpbin.org/anything");
+        assert!(matcher.is_ssl_proxy_match("https", "httpbin.org:443"));
+        assert!(!matcher.is_ssl_proxy_match("https", "example.com:443"));
+    }
+
+    #[test]
+    fn matcher_ssl_proxy_match_rejects_path_only_pattern() {
+        let matcher = Matcher::new("/anything");
+        assert!(!matcher.is_ssl_proxy_match("https", "httpbin.org:443"));
+    }
+
+    #[test]
     fn rules_default_disallows_mitm_without_allowlist() {
         let rules = Rules::default();
         assert!(!rules.is_mitm_allowed("https", "example.com:443"));
+    }
+
+    #[test]
+    fn rules_https_intercept_rule_enables_host_detection_without_allowlist() {
+        let rules = Rules {
+            allowlist: vec![],
+            map_local: vec![MapLocalRule {
+                matcher: Matcher::new("https://httpbin.org/anything"),
+                source: MapSource::Text("ok".to_string()),
+                status: StatusCode::OK,
+                content_type: Some("text/plain".to_string()),
+            }],
+            map_remote: vec![],
+            status_rewrite: vec![],
+        };
+
+        assert!(rules.has_https_intercept_rule("httpbin.org:443"));
+        assert!(!rules.has_https_intercept_rule("example.com:443"));
+        assert!(!rules.is_mitm_allowed("https", "httpbin.org:443"));
     }
 
     #[test]
